@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.9
+Bot-hosting Auto Renew v3.0
+相对 v2.9 的改动：
+- 修复：详情页等到「Console connected」后再判断状态，避免页面刚加载时的默认 Offline/Stopped 被误判为关机
+- 修复：Start 按钮同时检查 disabled / aria-disabled / class 含 disabled，置灰按钮不再误报「已点击」
+- 优化：SERVER_URL 只填路径（/a/d/<uuid>）时自动补全域名
+- 优化：合并 check_and_manage_server 中重复的 running 返回分支
+
 相对 v2.8 的改动：
 - 修复：不再用控制台残留「App is running」判断运行中；Stopped/Offline 徽章优先
 
 相对 v2.7 的改动：
 - 修复：总览页显示 OFFLINE/Stopped 时先进入 /a/d/<uuid> 详情页再开机（总览页无 Start 按钮）
-- 修复：find_server_link 优先匹配 /a/d/<uuid>（日志中已有 Manage -> /a/d/...）
+- 修复：find_server_link 优先匹配 /a/d/<uuid>
 - 保留 v2.7：可见文本判状态、主内容区找链接、邮箱脱敏、gh secret stdin
 """
 
@@ -42,8 +48,10 @@ COOKIES = {"session_token": SESSION_TOKEN, "login": "true", "theme": "system"}
 
 BASE = "https://bot-hosting.net"
 BILLINGS_URL = f"{BASE}/a/billings"
-# 可选：直接指定服务页，例如 https://bot-hosting.net/a/d/<uuid>；不填则自动从总览页发现
+# 可选：直接指定服务页，例如 https://bot-hosting.net/a/d/<uuid>（只填 /a/d/<uuid> 也可）
 SERVER_URL = (os.environ.get("SERVER_URL") or "").strip()
+if SERVER_URL.startswith("/"):
+    SERVER_URL = BASE + SERVER_URL
 # 服务详情页路径特征：/a/d/<uuid>
 SERVER_PATH_RE = re.compile(r"^/a/d/[0-9a-fA-F\-]{8,}")
 
@@ -113,6 +121,17 @@ def body_text(sb) -> str:
         return " ".join((sb.get_text("body") or "").split())
     except Exception:
         return ""
+
+
+def current_path(sb) -> str:
+    try:
+        return urllib.parse.urlparse(sb.get_current_url()).path
+    except Exception:
+        return ""
+
+
+def is_detail_page(sb) -> bool:
+    return bool(SERVER_PATH_RE.search(current_path(sb)))
 
 
 def get_cookie_info(sb, name: str):
@@ -345,16 +364,28 @@ def detect_server_status(text: str) -> str:
 
 
 # ==================== 服务器状态检测 / 开机 ====================
-def wait_page_ready(sb, timeout: int = 15) -> str:
-    """等待 SPA 渲染：出现状态词或 slots 字样即返回；超时也返回当前文本"""
+def wait_page_ready(sb, timeout: int = 20) -> str:
+    """
+    等待 SPA 渲染完成后返回页面文本。
+    - 详情页：必须等到控制台连上（Console connected）再判断，
+      避免控制台连接前的默认 Offline/Stopped 被误判为关机
+    - 总览页：出现状态词或 slots 字样即可
+    超时也返回当前文本。
+    """
     end = time.time() + timeout
     text = ""
+    need_console = is_detail_page(sb)
     while time.time() < end:
         text = body_text(sb)
-        if detect_server_status(text) != "unknown" or re.search(r"\d+\s*/\s*\d+\s*slots", text, re.I):
-            sb.sleep(1.5)  # 卡片通常比 slots 文案晚一点
+        ready = detect_server_status(text) != "unknown" or bool(
+            re.search(r"\d+\s*/\s*\d+\s*slots", text, re.I)
+        )
+        if ready and (not need_console or "console connected" in text.lower()):
+            sb.sleep(2)  # 状态徽章/时长通常比连接成功晚一点
             return body_text(sb)
         sb.sleep(1)
+    if need_console and "console connected" not in text.lower():
+        print("⚠️ 等待控制台连接超时，状态可能不可靠")
     return text
 
 
@@ -411,12 +442,15 @@ def find_server_link(sb) -> str | None:
 
 
 def click_start_button(sb) -> bool:
-    """只点文案精确为 Start / 启动 / 开机 的按钮（排除 Restart）"""
+    """只点文案精确为 Start / 启动 / 开机 且可用的按钮（排除 Restart、置灰按钮）"""
     try:
         clicked = sb.execute_script(r"""
             const ok = new Set(['start', '启动', '开机']);
             for (const n of document.querySelectorAll('button, a, [role="button"]')) {
-                if (n.disabled || n.closest('nav, aside, header, footer')) continue;
+                if (n.disabled
+                    || n.getAttribute('aria-disabled') === 'true'
+                    || /disabled/i.test(n.className || '')
+                    || n.closest('nav, aside, header, footer')) continue;
                 const t = (n.innerText || n.textContent || '').trim().toLowerCase();
                 if (ok.has(t)) { n.click(); return t; }
             }
@@ -458,15 +492,11 @@ def check_and_manage_server(sb) -> tuple[str, str]:
     sb.open(start_url)
     sb.wait_for_ready_state_complete()
     st, up, text = read_state(sb)
-    on_detail = bool(SERVER_PATH_RE.search(urllib.parse.urlparse(sb.get_current_url()).path))
+    on_detail = is_detail_page(sb)
     print(f"📊 {'服务页' if on_detail or SERVER_URL else '总览页'}状态: {st}, 时长: {up or '无'}")
     print(f"📄 页面文本: {text[:400]}")
 
-    if (st == "running" or up) and on_detail:
-        return "running", up
-    # 总览页偶发能解析到时长，也直接返回
     if st == "running" or up:
-        # 仍尽量进详情页核对一次（可选，节省时间则直接返回）
         return "running", up
 
     # 不在详情页时，一律先找 /a/d/<uuid> 进入（无论 stopped 还是 unknown）
@@ -480,7 +510,7 @@ def check_and_manage_server(sb) -> tuple[str, str]:
         sb.open(BASE + href if href.startswith("/") else href)
         sb.wait_for_ready_state_complete()
         st, up, text = read_state(sb)
-        on_detail = bool(SERVER_PATH_RE.search(urllib.parse.urlparse(sb.get_current_url()).path))
+        on_detail = is_detail_page(sb)
         print(f"📊 服务页状态: {st}, 时长: {up or '无'} (detail={on_detail})")
         print(f"📄 服务页文本: {text[:400]}")
         if st == "running" or up:
@@ -492,20 +522,18 @@ def check_and_manage_server(sb) -> tuple[str, str]:
         return "unknown", ""
 
     # 明确未运行 → 仅在详情页开机
-    if not on_detail and not SERVER_URL:
-        path = urllib.parse.urlparse(sb.get_current_url()).path
-        if not SERVER_PATH_RE.search(path):
-            print("⚠️ 未处于服务详情页，放弃开机")
-            dump_debug(sb, "not_on_detail")
-            return "start_failed", ""
+    if not on_detail:
+        print("⚠️ 未处于服务详情页，放弃开机")
+        dump_debug(sb, "not_on_detail")
+        return "start_failed", ""
 
     print("🔌 检测到未运行，尝试开机...")
     if not click_start_button(sb):
-        print("⚠️ 未找到 Start 按钮")
+        print("⚠️ 未找到可用的 Start 按钮")
         dump_debug(sb, "no_start_btn")
         return "start_failed", ""
 
-    for _ in range(4):  # 最多等待约 30 秒
+    for _ in range(5):  # 最多等待约 35 秒
         sb.sleep(7)
         text = body_text(sb)
         up = extract_app_uptime(text) or ""
@@ -749,7 +777,7 @@ def main():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.9")
+    print("   Bot-hosting 自动续期 v3.0")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
