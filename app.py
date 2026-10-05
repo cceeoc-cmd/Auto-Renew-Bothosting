@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.7
-相对 v2.6 的改动：
-- 修复：进入服务页误点 /a/credits（只在主内容区找链接，排除侧边栏与非服务路径）
-- 修复：状态 unknown 时不再乱点 Start，只有明确 stopped/offline 才开机
-- 修复：状态检测改用 body 可见文本，不再匹配整页源码(含 JS)
-- 新增：等待页面渲染完成再判断；失败时打印全部链接和完整文本，便于定位
-- 安全：日志中的邮箱脱敏；gh secret 通过 stdin 传值，不再放命令行参数
-- 清理：未使用导入、重复注释、死代码；续期按钮判断改用正则
+Bot-hosting Auto Renew v2.8
+相对 v2.7 的改动：
+- 修复：总览页显示 OFFLINE/Stopped 时先进入 /a/d/<uuid> 详情页再开机（总览页无 Start 按钮）
+- 修复：find_server_link 优先匹配 /a/d/<uuid>（日志中已有 Manage -> /a/d/...）
+- 保留 v2.7：可见文本判状态、主内容区找链接、邮箱脱敏、gh secret stdin
 """
 
 import os
@@ -445,32 +442,40 @@ def check_and_manage_server(sb) -> tuple[str, str]:
     返回 (status, uptime)
     status: running / started / start_failed / unknown
     - running  → 记录时长
-    - stopped  → 点 Start
-    - unknown  → 不操作，仅记录并输出调试信息
+    - stopped  → 进入详情页后点 Start
+    - unknown  → 尝试进详情页再判断；仍未知则不操作
+    关键：总览页即使显示 OFFLINE/Stopped，也必须先进入 /a/d/<uuid>
+          详情页才有 Start 按钮，总览页点不到。
     """
     start_url = SERVER_URL or f"{BASE}/a/"
     sb.open(start_url)
     sb.wait_for_ready_state_complete()
     st, up, text = read_state(sb)
-    print(f"📊 {'服务页' if SERVER_URL else '总览页'}状态: {st}, 时长: {up or '无'}")
-    print(f"📄 页面文本: {text[:300]}")
+    on_detail = bool(SERVER_PATH_RE.search(urllib.parse.urlparse(sb.get_current_url()).path))
+    print(f"📊 {'服务页' if on_detail or SERVER_URL else '总览页'}状态: {st}, 时长: {up or '无'}")
+    print(f"📄 页面文本: {text[:400]}")
 
+    if (st == "running" or up) and on_detail:
+        return "running", up
+    # 总览页偶发能解析到时长，也直接返回
     if st == "running" or up:
+        # 仍尽量进详情页核对一次（可选，节省时间则直接返回）
         return "running", up
 
-    # 总览页没有状态 → 进入服务详情页
-    if st == "unknown":
+    # 不在详情页时，一律先找 /a/d/<uuid> 进入（无论 stopped 还是 unknown）
+    if not on_detail and not SERVER_URL:
         href = find_server_link(sb)
         if not href:
-            print("⚠️ 未找到服务器链接")
+            print("⚠️ 未找到服务器链接 (/a/d/...)")
             dump_debug(sb, "no_server_link")
             return "unknown", ""
         print(f"➡️ 进入服务页: {href}")
-        sb.open(BASE + href)
+        sb.open(BASE + href if href.startswith("/") else href)
         sb.wait_for_ready_state_complete()
         st, up, text = read_state(sb)
-        print(f"📊 服务页状态: {st}, 时长: {up or '无'}")
-        print(f"📄 服务页文本: {text[:300]}")
+        on_detail = bool(SERVER_PATH_RE.search(urllib.parse.urlparse(sb.get_current_url()).path))
+        print(f"📊 服务页状态: {st}, 时长: {up or '无'} (detail={on_detail})")
+        print(f"📄 服务页文本: {text[:400]}")
         if st == "running" or up:
             return "running", up
 
@@ -479,7 +484,14 @@ def check_and_manage_server(sb) -> tuple[str, str]:
         dump_debug(sb, "status_unknown")
         return "unknown", ""
 
-    # 明确未运行 → 开机
+    # 明确未运行 → 仅在详情页开机
+    if not on_detail and not SERVER_URL:
+        path = urllib.parse.urlparse(sb.get_current_url()).path
+        if not SERVER_PATH_RE.search(path):
+            print("⚠️ 未处于服务详情页，放弃开机")
+            dump_debug(sb, "not_on_detail")
+            return "start_failed", ""
+
     print("🔌 检测到未运行，尝试开机...")
     if not click_start_button(sb):
         print("⚠️ 未找到 Start 按钮")
@@ -730,7 +742,7 @@ def main():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.7")
+    print("   Bot-hosting 自动续期 v2.8")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
