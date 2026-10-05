@@ -2,37 +2,45 @@ name: Auto Renew Bot-hosting
 
 on:
   schedule:
-    - cron: '0 1 * * *' # 每天UTC 1点 (北京时间9点, 一般都会推迟),自行根据服务到期时间调整
+    # 每天 UTC 22:30 ≈ 北京时间 06:30（可根据实际到期时间自行调整）
+    - cron: '30 22 * * *'
   workflow_dispatch:
 
 jobs:
   Renew-bot:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: write
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
 
-      - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          pip install --upgrade pip
           pip install seleniumbase requests
           seleniumbase install chromedriver
 
-      - name: ⚙ 设置代理 (sing-box)
+      - name: 🔗 设置代理 (sing-box)
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          if [ -n "$NODE_LINK" ]; then
+            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          else
+            echo "未配置 NODE_LINK，跳过代理"
+          fi
 
       - name: 🚀 运行续期脚本
         env:
@@ -45,6 +53,16 @@ jobs:
         run: |
           xvfb-run --auto-servernum python3 app.py
 
+      - name: 📸 上传调试截图（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: |
+            *.png
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
@@ -52,18 +70,18 @@ jobs:
           pkill -f chromedriver || true
           pkill -f chrome || true
           pkill -f Xvfb || true
-          rm -f sing-box sing-box-config.json sing-box.log
+          rm -f sing-box sing-box-config.json sing-box.log || true
 
-      - name: 🧹 清理旧的工作流运行记录
+      - name: 🧹 清理旧的工作流运行记录（保留最近 5 条）
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=50 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
+            if [ $count -gt 5 ]; then
               echo "删除运行记录: $run_id"
               gh run delete $run_id || true
             fi
