@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.1
+Bot-hosting Auto Renew v2.2
 优化点：
 - 显式等待替代硬编码 sleep
 - 更稳健的元素定位与到期日期解析
@@ -9,7 +9,7 @@ Bot-hosting Auto Renew v2.1
 - 时区用 zoneinfo
 - 登录 / 续期 / 更新 Token 逻辑更清晰
 - 代理与 IP 检测更友好
-- TG 通知：邮箱脱敏 a***a@mail.com + 运行时长
+- TG 通知：邮箱脱敏 a***a@mail.com + 运行时长\n- 自动提取登录账号；倒计时改为「小时/分」
 """
 
 import os
@@ -52,6 +52,7 @@ COOKIES = {
 
 _LOGIN_METHOD = "SESSION_TOKEN"
 _START_TIME = None  # 脚本启动时间，用于计算运行时长
+_ACCOUNT = ""  # 登录后从页面提取的账号
 TZ_CN = ZoneInfo("Asia/Shanghai")
 
 # Discord OAuth 常量
@@ -187,16 +188,20 @@ def format_notification(
     extra: str = "",
     error: str = "",
     expiry_date: str = "",
+    account: str = "",
 ) -> str:
     duration_str = ""
     if _START_TIME is not None:
         duration_str = format_duration(time.time() - _START_TIME)
 
+    # 优先：传入的 account > 页面提取的 _ACCOUNT > Secrets EMAIL
+    display_account = mask_email(account or _ACCOUNT or EMAIL)
+
     lines = [
         "🇫🇮 Bot-hosting 续期通知",
         "",
         status,
-        f"👤 登录账户: {mask_email(EMAIL)}",
+        f"👤 登录账户: {display_account}",
     ]
     if _LOGIN_METHOD != "SESSION_TOKEN":
         lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
@@ -235,12 +240,15 @@ def get_current_ip(proxy_server: str = "") -> str:
 
 
 def format_countdown(countdown_str: str) -> str:
+    """将 23:27:00 转为 23小时27分"""
     try:
         h, m, _ = countdown_str.split(":")
         h, m = int(h), int(m)
+        if h > 0 and m > 0:
+            return f"{h}小时{m}分"
         if h > 0:
-            return f"{h}h{m}min"
-        return f"{m}min"
+            return f"{h}小时"
+        return f"{m}分"
     except Exception:
         return countdown_str
 
@@ -263,6 +271,30 @@ def extract_expiry_date(page_source: str) -> str | None:
             if len(parts) == 3 and len(parts[0]) == 2 and len(parts[2]) == 4:
                 return f"{parts[2]}/{parts[0]}/{parts[1]}"
             return date_str
+    return None
+
+
+def extract_account_email(page_source: str) -> str | None:
+    """从页面中尽量提取登录邮箱/用户标识"""
+    # 优先匹配常见邮箱
+    emails = re.findall(
+        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+        page_source,
+    )
+    skip = {"example.com", "sentry.io", "w3.org", "github.com", "google.com",
+            "cloudflare.com", "discord.com", "bot-hosting.net"}
+    for e in emails:
+        domain = e.split("@")[-1].lower()
+        if domain in skip or e.lower().startswith("noreply"):
+            continue
+        # 过滤明显不是用户邮箱的
+        if any(x in e.lower() for x in ["support@", "admin@", "no-reply", "noreply"]):
+            continue
+        return e
+    # 备选：Discord 用户名类
+    m = re.search(r"(?:logged in as|welcome|user(?:name)?)[:\s]+([\w.#-]{2,32})", page_source, re.I)
+    if m:
+        return m.group(1)
     return None
 
 
@@ -562,11 +594,12 @@ def do_renew(sb, current_expiry: str | None) -> bool:
 
 # ==================== 主流程 ====================
 def main():
-    global _START_TIME
+    global _START_TIME, _ACCOUNT
     _START_TIME = time.time()
+    _ACCOUNT = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.1")
+    print("   Bot-hosting 自动续期 v2.2")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -655,7 +688,7 @@ def main():
         if _LOGIN_METHOD == "Discord Token":
             print("ℹ️ 本次使用 Discord 登录，将尝试更新 SESSION_TOKEN")
 
-        # ---------- 提取到期日期 ----------
+        # ---------- 提取到期日期 & 登录账号 ----------
         sb.sleep(1.5)
         page_source = sb.get_page_source()
         current_expiry = extract_expiry_date(page_source)
@@ -663,6 +696,12 @@ def main():
             print(f"📅 当前到期日期: {current_expiry}")
         else:
             print("⚠️ 未能提取当前到期日期")
+
+        _ACCOUNT = extract_account_email(page_source) or ""
+        if _ACCOUNT:
+            print(f"👤 登录账号: {_ACCOUNT}")
+        else:
+            print("⚠️ 未能从页面提取登录账号，将使用 EMAIL Secret")
 
         # ---------- 执行续期 ----------
         do_renew(sb, current_expiry)
