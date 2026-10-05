@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.6
+Bot-hosting Auto Renew v2.7
 优化点：
 - 显式等待替代硬编码 sleep
 - 更稳健的元素定位与到期日期解析
@@ -476,46 +476,66 @@ def _click_start_button(sb) -> bool:
 
 
 def open_first_deployment(sb) -> bool:
-    """从控制台进入第一个部署/服务详情页"""
+    """从 Overview 进入部署/服务详情，严禁跳到 Credits/Billing/Settings 等。"""
     before = sb.get_current_url()
     try:
         clicked = sb.execute_script(r"""
-            const skip = /billings|login|settings|billing|account|docs|pricing|changelog|support/i;
-            const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="server"], [class*="deploy"], [class*="project"], [class*="item"]'));
+            const skipRe = /billings?|credits?|affiliation|templates?|settings?|login|account|docs|pricing|changelog|support|discord|status|advertise|knowledge/i;
+            const goodRe = /deploy|project|fleet|server|manage|console|app/i;
+            const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="project"], [class*="deploy"], [class*="item"]'));
 
-            // 1) 卡片内含 Running/Stopped 且可点
+            // 0) 明确的「Skip to deployments」无障碍链接
             for (const n of nodes) {
-                const t = (n.innerText || n.textContent || '');
-                if (/Running[\s]+\d/i.test(t) || />?\s*Stopped\s*/i.test(t) || /Offline/i.test(t) || /运行中|已停止/.test(t)) {
-                    const href = n.getAttribute && (n.getAttribute('href') || '');
-                    if (href && skip.test(href)) continue;
+                const t = (n.innerText || n.textContent || '').trim().toLowerCase();
+                if (t.includes('skip to deployment') || t === 'deployments') {
                     n.click();
-                    return 'status:' + t.slice(0, 40);
+                    return 'skip-deployments';
                 }
             }
 
-            // 2) 链接路径比当前更深（服务详情）
-            const cur = location.pathname.replace(/\/$/, '') || '/';
+            // 1) 带 Running/Stopped 状态的卡片
             for (const n of nodes) {
-                const href = n.getAttribute && (n.getAttribute('href') || '');
-                if (!href || skip.test(href)) continue;
+                const t = (n.innerText || n.textContent || '');
+                if (/Running[\s]+\d/i.test(t) || />?\s*Stopped\s*</i.test(t) || /运行中\s*\d/.test(t)) {
+                    const href = (n.getAttribute && n.getAttribute('href')) || '';
+                    if (href && skipRe.test(href)) continue;
+                    n.click();
+                    return 'status-card';
+                }
+            }
+
+            // 2) href 像部署详情，且不是 credits/settings
+            const cur = (location.pathname.replace(/\/$/, '') || '/');
+            const scored = [];
+            for (const n of nodes) {
+                const href = (n.getAttribute && n.getAttribute('href')) || '';
+                if (!href || skipRe.test(href)) continue;
                 try {
                     const u = new URL(href, location.origin);
                     if (u.origin !== location.origin) continue;
                     const path = u.pathname.replace(/\/$/, '') || '/';
-                    // 排除点到自己
                     if (path === cur || path === '/a' || path === '/') continue;
-                    if (path.startsWith('/a/') || path.includes('server') || path.includes('project') || path.includes('deploy')) {
-                        n.click();
-                        return href;
-                    }
+                    if (skipRe.test(path)) continue;
+                    let score = 0;
+                    if (goodRe.test(path) || goodRe.test(href)) score += 5;
+                    if (/\/a\/[^/]+/.test(path) && path.split('/').length >= 3) score += 3;
+                    const t = (n.innerText || n.textContent || '').trim();
+                    if (/^myapp$/i.test(t) || /deploy/i.test(t)) score += 4;
+                    if (score > 0) scored.push({n, score, href, t: t.slice(0, 40)});
                 } catch (e) {}
             }
+            scored.sort((a, b) => b.score - a.score);
+            if (scored.length) {
+                scored[0].n.click();
+                return scored[0].href + '|' + scored[0].t;
+            }
 
-            // 3) Manage / Open / 应用名样式
+            // 3) 按钮/链接文案
             for (const n of nodes) {
                 const t = (n.innerText || n.textContent || '').trim().toLowerCase();
-                if (['manage', 'open', '管理', '打开', 'console'].includes(t)) {
+                if (['manage', 'open', '管理', '打开', 'console', 'deploy'].includes(t)) {
+                    const href = (n.getAttribute && n.getAttribute('href')) || '';
+                    if (href && skipRe.test(href)) continue;
                     n.click();
                     return t;
                 }
@@ -527,7 +547,10 @@ def open_first_deployment(sb) -> bool:
             sb.wait_for_ready_state_complete()
             after = sb.get_current_url()
             print(f"➡️ 进入服务页: {clicked} | {before} -> {after}")
-            # URL 没变也再等一会儿（SPA）
+            # 若误进 credits/settings，视为失败
+            if re.search(r"credits|affiliation|templates|settings|billing", after, re.I):
+                print(f"⚠️ 误入无关页面，放弃: {after}")
+                return False
             if after == before:
                 sb.sleep(3)
             return True
@@ -536,21 +559,30 @@ def open_first_deployment(sb) -> bool:
     return False
 
 
+def page_has_power_controls(page_source: str) -> bool:
+    """是否在服务详情页（有 Start/Stop/Kill/Restart 控制条）"""
+    lower = page_source.lower()
+    has_stop = bool(re.search(r">\s*stop\s*<", lower) or re.search(r"\bkill\b", lower))
+    has_start = bool(re.search(r">\s*start\s*<", lower) or re.search(r">\s*restart\s*<", lower))
+    return has_stop or has_start
+
+
 def check_and_manage_server(sb) -> tuple[str, str]:
     """
     检测机器状态：
       - running  → 记录运行时长，跳过开机
-      - stopped/offline → 执行开机
+      - stopped/offline → 仅在服务详情页执行开机
     返回 (status, uptime_str)
-    status: running / started / start_failed / unknown
     """
     status = "unknown"
     uptime = ""
 
+    # 优先尝试更可能的部署相关路径
     candidate_urls = [
         "https://bot-hosting.net/a/",
+        "https://bot-hosting.net/a/deployments",
+        "https://bot-hosting.net/a/projects",
         "https://bot-hosting.net/",
-        "https://bot-hosting.net/a/panel",
     ]
 
     for url in candidate_urls:
@@ -558,7 +590,6 @@ def check_and_manage_server(sb) -> tuple[str, str]:
             print(f"🌐 访问: {url}")
             sb.open(url)
             sb.wait_for_ready_state_complete()
-            # SPA 动态加载，多等一会儿
             sb.sleep(5)
         except Exception as e:
             print(f"⚠️ 访问失败: {e}")
@@ -568,10 +599,9 @@ def check_and_manage_server(sb) -> tuple[str, str]:
         st = detect_server_status(src)
         up = extract_app_uptime(src) or ""
         print(f"📊 页面状态: {st}, 时长: {up or '无'}")
-        # 调试：打印页面可见文本片段
         try:
             body_text = sb.get_text("body") or ""
-            snippet = " ".join(body_text.split())[:300]
+            snippet = " ".join(body_text.split())[:400]
             print(f"📄 页面摘要: {snippet}")
         except Exception:
             pass
@@ -579,7 +609,7 @@ def check_and_manage_server(sb) -> tuple[str, str]:
         if st == "running" or up:
             return ("running", up)
 
-        # 尝试进入具体服务页
+        # 从 Overview 点进具体部署
         if open_first_deployment(sb):
             src = sb.get_page_source()
             st = detect_server_status(src)
@@ -587,43 +617,46 @@ def check_and_manage_server(sb) -> tuple[str, str]:
             print(f"📊 服务页状态: {st}, 时长: {up or '无'}")
             try:
                 body_text = sb.get_text("body") or ""
-                snippet = " ".join(body_text.split())[:300]
+                snippet = " ".join(body_text.split())[:400]
                 print(f"📄 服务页摘要: {snippet}")
             except Exception:
                 pass
+
             if st == "running" or up:
                 return ("running", up)
 
-            if st in ("stopped", "offline", "unknown"):
-                # 尝试开机
-                print("🔌 检测到未运行，尝试开机...")
-                if _click_start_button(sb):
-                    sb.sleep(8)
-                    sb.wait_for_ready_state_complete()
-                    src2 = sb.get_page_source()
-                    up2 = extract_app_uptime(src2) or ""
-                    st2 = detect_server_status(src2)
-                    if st2 == "running" or up2:
-                        print(f"✅ 开机成功，运行时长: {up2 or '启动中'}")
-                        return ("started", up2 or "启动中")
-                    # 再等一轮
-                    sb.sleep(5)
-                    src3 = sb.get_page_source()
-                    up3 = extract_app_uptime(src3) or ""
-                    if up3 or detect_server_status(src3) == "running":
-                        print(f"✅ 开机成功，运行时长: {up3 or '启动中'}")
-                        return ("started", up3 or "启动中")
-                    print("⚠️ 已点 Start，但状态仍未变为 Running")
-                    save_debug_screenshot(sb, "start_pending")
-                    return ("start_failed", "")
-                else:
-                    print("⚠️ 未找到 Start 按钮")
-                    save_debug_screenshot(sb, "no_start_btn")
-                    return ("start_failed", "")
+            # 只有确认在控制台详情页时才尝试开机
+            if page_has_power_controls(src):
+                if st in ("stopped", "offline", "unknown"):
+                    print("🔌 服务详情页未运行，尝试开机...")
+                    if _click_start_button(sb):
+                        sb.sleep(8)
+                        sb.wait_for_ready_state_complete()
+                        src2 = sb.get_page_source()
+                        up2 = extract_app_uptime(src2) or ""
+                        st2 = detect_server_status(src2)
+                        if st2 == "running" or up2:
+                            print(f"✅ 开机成功，运行时长: {up2 or '启动中'}")
+                            return ("started", up2 or "启动中")
+                        sb.sleep(5)
+                        src3 = sb.get_page_source()
+                        up3 = extract_app_uptime(src3) or ""
+                        if up3 or detect_server_status(src3) == "running":
+                            print(f"✅ 开机成功，运行时长: {up3 or '启动中'}")
+                            return ("started", up3 or "启动中")
+                        print("⚠️ 已点 Start，但状态仍未变为 Running")
+                        save_debug_screenshot(sb, "start_pending")
+                        return ("start_failed", "")
+                    else:
+                        print("⚠️ 未找到 Start 按钮")
+                        save_debug_screenshot(sb, "no_start_btn")
+                        return ("start_failed", "")
+            else:
+                print("ℹ️ 当前页无 Start/Stop 控制条，跳过开机（可能仍在列表页）")
 
-        # 当前列表页就显示 stopped，直接点 Start
-        if st in ("stopped", "offline"):
-            print("🔌 列表页显示未运行，尝试开机...")
+        # 当前页本身就是详情页
+        if page_has_power_controls(src) and st in ("stopped", "offline"):
+            print("🔌 详情页显示未运行，尝试开机...")
             if _click_start_button(sb):
                 sb.sleep(8)
                 src2 = sb.get_page_source()
@@ -635,6 +668,7 @@ def check_and_manage_server(sb) -> tuple[str, str]:
     return (status, uptime)
 
 
+# ==================== Discord OAuth ====================
 # ==================== Discord OAuth ====================
 # ==================== Discord OAuth ====================
 def capture_discord_state(sb) -> str:
@@ -939,7 +973,7 @@ def main():
     _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.6")
+    print("   Bot-hosting 自动续期 v2.7")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
