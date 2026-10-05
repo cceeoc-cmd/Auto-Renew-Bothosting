@@ -52,8 +52,8 @@ jobs:
         run: |
           xvfb-run --auto-servernum python3 app.py
 
-      - name: 📸 上传调试截图（失败时）
-        if: failure()
+      - name: 📸 上传调试截图
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
