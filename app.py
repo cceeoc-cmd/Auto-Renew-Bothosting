@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.8
+Bot-hosting Auto Renew v2.9
+相对 v2.8 的改动：
+- 修复：不再用控制台残留「App is running」判断运行中；Stopped/Offline 徽章优先
+
 相对 v2.7 的改动：
 - 修复：总览页显示 OFFLINE/Stopped 时先进入 /a/d/<uuid> 详情页再开机（总览页无 Start 按钮）
 - 修复：find_server_link 优先匹配 /a/d/<uuid>（日志中已有 Manage -> /a/d/...）
@@ -326,14 +329,18 @@ def extract_app_uptime(text: str) -> str | None:
 def detect_server_status(text: str) -> str:
     """
     基于页面可见文本判断：running / stopped / unknown
-    按钮文案 Stop / Start 不会被当成状态（Stopped 必须是完整单词）。
+    - 以状态徽章为准：Running <时长> / Stopped / Offline
+    - 不用 "App is running"（控制台残留日志会误判）
+    - 按钮文案 Start/Stop 不会被当成状态
     """
-    if re.search(r"Running\s+\d", text, re.I) or re.search(r"App is running", text, re.I):
-        return "running"
-    if re.search(r"运行中\s*\d", text):
-        return "running"
+    # 先看明确的停止徽章（优先于控制台旧日志）
     if re.search(r"\b(Stopped|Offline|Suspended)\b", text, re.I) or re.search(r"已停止|已关机|离线", text):
-        return "stopped"
+        # 若同时有 Running+时长徽章，以 Running 为准（刷新瞬间可能两者短暂共存）
+        if not re.search(r"Running\s+\d", text, re.I):
+            return "stopped"
+    # 运行中：必须带时长数字，避免裸 Running 文案
+    if re.search(r"Running\s+\d", text, re.I) or re.search(r"运行中\s*\d", text):
+        return "running"
     return "unknown"
 
 
@@ -742,7 +749,7 @@ def main():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.8")
+    print("   Bot-hosting 自动续期 v2.9")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
