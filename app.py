@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.4
+Bot-hosting Auto Renew v2.5
 优化点：
 - 显式等待替代硬编码 sleep
 - 更稳健的元素定位与到期日期解析
@@ -339,21 +339,32 @@ def extract_app_uptime(page_source: str) -> str | None:
 def detect_server_status(page_source: str) -> str:
     """
     返回: running / stopped / offline / unknown
+    注意：页面上的 Stop/Start 按钮文案不能当作状态。
     """
-    lower = page_source.lower()
-    # 优先看明确状态
-    if re.search(r"running\s+\d", lower) or "运行中" in page_source:
+    # 强信号：Running 后面跟时长数字（徽章）
+    if re.search(r"Running\s+\d+\s*[smhd]", page_source, re.I):
         return "running"
-    # Stopped / Offline / 已停止
-    if re.search(r"\bstopped\b", lower) or "已停止" in page_source or "已关机" in page_source:
+    if re.search(r"运行中\s*\d+", page_source):
+        return "running"
+    # 控制台常见文案
+    if re.search(r"App is running", page_source, re.I):
+        return "running"
+
+    # 强信号：状态徽章 Stopped / Offline（避免匹配按钮 Stop）
+    # 典型：>Stopped<  或  "Stopped" 作为独立状态词且附近无 Start 启用特征
+    if re.search(r"(?:status|badge|state)[^>]{0,40}stopped", page_source, re.I):
         return "stopped"
-    if re.search(r"\boffline\b", lower) or "离线" in page_source:
+    if re.search(r">\s*Stopped\s*<", page_source, re.I):
+        return "stopped"
+    if re.search(r">\s*Offline\s*<", page_source, re.I) or re.search(r"\bOffline\b", page_source):
+        # Offline 较少出现在按钮上
+        if not re.search(r"Running\s+\d", page_source, re.I):
+            return "offline"
+    if "已停止" in page_source or "已关机" in page_source:
+        return "stopped"
+    if "离线" in page_source and not re.search(r"Running\s+\d", page_source, re.I):
         return "offline"
-    # 有明显 Start 按钮且没有 Running 计时，倾向 stopped
-    if re.search(r">\s*start\s*<", lower) and not re.search(r"running\s+\d", lower):
-        # 同时有 Stop 可能是 running；没有 Running 文本时保守判断
-        if "kill" in lower and "restart" in lower and not re.search(r"running", lower):
-            return "stopped"
+
     return "unknown"
 
 
@@ -409,29 +420,45 @@ def _click_start_button(sb) -> bool:
 
 def open_first_deployment(sb) -> bool:
     """从控制台进入第一个部署/服务详情页"""
+    before = sb.get_current_url()
     try:
         clicked = sb.execute_script(r"""
-            const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="server"], [class*="deploy"], [class*="project"]'));
-            // 1) 带 Running/Stopped 状态的卡片
+            const skip = /billings|login|settings|billing|account|docs|pricing|changelog|support/i;
+            const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="server"], [class*="deploy"], [class*="project"], [class*="item"]'));
+
+            // 1) 卡片内含 Running/Stopped 且可点
             for (const n of nodes) {
                 const t = (n.innerText || n.textContent || '');
-                if (/Running[\s]+\d/i.test(t) || /Stopped/i.test(t) || /Offline/i.test(t) || /运行中|已停止|离线/.test(t)) {
+                if (/Running[\s]+\d/i.test(t) || />?\s*Stopped\s*/i.test(t) || /Offline/i.test(t) || /运行中|已停止/.test(t)) {
+                    const href = n.getAttribute && (n.getAttribute('href') || '');
+                    if (href && skip.test(href)) continue;
                     n.click();
-                    return 'status-card';
+                    return 'status:' + t.slice(0, 40);
                 }
             }
-            // 2) 像服务详情的链接
+
+            // 2) 链接路径比当前更深（服务详情）
+            const cur = location.pathname.replace(/\/$/, '') || '/';
             for (const n of nodes) {
                 const href = n.getAttribute && (n.getAttribute('href') || '');
-                if (href && /\/a\//.test(href) && !/billings|login|settings|billing|account|docs/i.test(href)) {
-                    n.click();
-                    return href;
-                }
+                if (!href || skip.test(href)) continue;
+                try {
+                    const u = new URL(href, location.origin);
+                    if (u.origin !== location.origin) continue;
+                    const path = u.pathname.replace(/\/$/, '') || '/';
+                    // 排除点到自己
+                    if (path === cur || path === '/a' || path === '/') continue;
+                    if (path.startsWith('/a/') || path.includes('server') || path.includes('project') || path.includes('deploy')) {
+                        n.click();
+                        return href;
+                    }
+                } catch (e) {}
             }
-            // 3) 文本 Manage / Open
+
+            // 3) Manage / Open / 应用名样式
             for (const n of nodes) {
                 const t = (n.innerText || n.textContent || '').trim().toLowerCase();
-                if (t === 'manage' || t === 'open' || t === '管理' || t === '打开') {
+                if (['manage', 'open', '管理', '打开', 'console'].includes(t)) {
                     n.click();
                     return t;
                 }
@@ -439,9 +466,13 @@ def open_first_deployment(sb) -> bool:
             return false;
         """)
         if clicked:
-            print(f"➡️ 进入服务页: {clicked}")
-            sb.sleep(3)
+            sb.sleep(4)
             sb.wait_for_ready_state_complete()
+            after = sb.get_current_url()
+            print(f"➡️ 进入服务页: {clicked} | {before} -> {after}")
+            # URL 没变也再等一会儿（SPA）
+            if after == before:
+                sb.sleep(3)
             return True
     except Exception as e:
         print(f"⚠️ 进入服务页失败: {e}")
@@ -470,7 +501,8 @@ def check_and_manage_server(sb) -> tuple[str, str]:
             print(f"🌐 访问: {url}")
             sb.open(url)
             sb.wait_for_ready_state_complete()
-            sb.sleep(2)
+            # SPA 动态加载，多等一会儿
+            sb.sleep(5)
         except Exception as e:
             print(f"⚠️ 访问失败: {e}")
             continue
@@ -479,6 +511,13 @@ def check_and_manage_server(sb) -> tuple[str, str]:
         st = detect_server_status(src)
         up = extract_app_uptime(src) or ""
         print(f"📊 页面状态: {st}, 时长: {up or '无'}")
+        # 调试：打印页面可见文本片段
+        try:
+            body_text = sb.get_text("body") or ""
+            snippet = " ".join(body_text.split())[:300]
+            print(f"📄 页面摘要: {snippet}")
+        except Exception:
+            pass
 
         if st == "running" or up:
             return ("running", up)
@@ -489,6 +528,12 @@ def check_and_manage_server(sb) -> tuple[str, str]:
             st = detect_server_status(src)
             up = extract_app_uptime(src) or ""
             print(f"📊 服务页状态: {st}, 时长: {up or '无'}")
+            try:
+                body_text = sb.get_text("body") or ""
+                snippet = " ".join(body_text.split())[:300]
+                print(f"📄 服务页摘要: {snippet}")
+            except Exception:
+                pass
             if st == "running" or up:
                 return ("running", up)
 
@@ -837,7 +882,7 @@ def main():
     _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.4")
+    print("   Bot-hosting 自动续期 v2.5")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
