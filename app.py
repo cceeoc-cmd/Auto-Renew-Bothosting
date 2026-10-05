@@ -2,16 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Bot-hosting Auto Renew v2.7
-优化点：
-- 显式等待替代硬编码 sleep
-- 更稳健的元素定位与到期日期解析
-- 统一截图 + 失败时自动保存
-- 时区用 zoneinfo
-- 登录 / 续期 / 更新 Token 逻辑更清晰
-- 代理与 IP 检测更友好
-- TG 通知：邮箱脱敏 a***a@mail.com
-- 自动提取登录账号；倒计时「小时/分」
-- 运行时长 = 面板 App Running 时间；脚本耗时单独显示
+相对 v2.6 的改动：
+- 修复：进入服务页误点 /a/credits（只在主内容区找链接，排除侧边栏与非服务路径）
+- 修复：状态 unknown 时不再乱点 Start，只有明确 stopped/offline 才开机
+- 修复：状态检测改用 body 可见文本，不再匹配整页源码(含 JS)
+- 新增：等待页面渲染完成再判断；失败时打印全部链接和完整文本，便于定位
+- 安全：日志中的邮箱脱敏；gh secret 通过 stdin 传值，不再放命令行参数
+- 清理：未使用导入、重复注释、死代码；续期按钮判断改用正则
 """
 
 import os
@@ -22,11 +19,9 @@ import json
 import requests
 import subprocess
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from seleniumbase import SB
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 # ==================== 配置 ====================
 EMAIL = os.environ.get("EMAIL") or ""
@@ -37,31 +32,38 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
 # 解析 DISCORD_TOKEN（支持 "备注,token" 格式）
-DC_TOKEN = ""
-if DISCORD_TOKEN:
-    parts = DISCORD_TOKEN.split(",", 1)
-    DC_TOKEN = parts[-1].strip()
+DC_TOKEN = DISCORD_TOKEN.split(",", 1)[-1].strip() if DISCORD_TOKEN else ""
 
 if not SESSION_TOKEN and not DC_TOKEN:
     print("ℹ️ 未配置 SESSION_TOKEN 和 DISCORD_TOKEN，脚本终止。")
     sys.exit(1)
 
-COOKIES = {
-    "session_token": SESSION_TOKEN,
-    "login": "true",
-    "theme": "system",
-}
+COOKIES = {"session_token": SESSION_TOKEN, "login": "true", "theme": "system"}
+
+BASE = "https://bot-hosting.net"
+BILLINGS_URL = f"{BASE}/a/billings"
+# 可选：直接指定服务页，例如 https://bot-hosting.net/a/d/<uuid>；不填则自动从总览页发现
+SERVER_URL = (os.environ.get("SERVER_URL") or "").strip()
+# 服务详情页路径特征：/a/d/<uuid>
+SERVER_PATH_RE = re.compile(r"^/a/d/[0-9a-fA-F\-]{8,}")
 
 _LOGIN_METHOD = "SESSION_TOKEN"
-_START_TIME = None  # 脚本启动时间
-_ACCOUNT = ""       # 登录后从页面提取的账号
-_APP_UPTIME = ""    # 面板上 App 的 Running 时长
-_SERVER_STATUS = "" # running / started / start_failed / unknown
+_START_TIME = None
+_ACCOUNT = ""
+_APP_UPTIME = ""
+_SERVER_STATUS = ""  # running / started / start_failed / unknown
 TZ_CN = ZoneInfo("Asia/Shanghai")
+
+# 侧边栏 / 非服务页路径，进入服务页时必须排除
+NON_SERVER_SEGMENTS = {
+    "billings", "billing", "credits", "affiliation", "affiliate", "templates",
+    "settings", "account", "login", "docs", "pricing", "changelog", "support",
+    "status", "discord", "developer", "knowledge", "advertise", "deploy", "new",
+}
 
 # Discord OAuth 常量
 DISCORD_CLIENT_ID = "884382422530158623"
-OAUTH_REDIRECT_URI = "https://bot-hosting.net/login"
+OAUTH_REDIRECT_URI = f"{BASE}/login"
 OAUTH_SCOPE = "identify email guilds"
 DISCORD_API = "https://discord.com/api/v9/oauth2/authorize"
 DISCORD_UA = (
@@ -70,13 +72,14 @@ DISCORD_UA = (
 )
 STATE_RE = re.compile(r"[?&]state=([^&]+)")
 
+
 # ==================== 工具函数 ====================
 def now_cn() -> str:
     return datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def mask_email(email: str) -> str:
-    """脱敏格式：a***a@mail.com（首尾各保留1位）"""
+    """脱敏：a***a@mail.com"""
     if not email:
         return "未配置"
     if "@" in email:
@@ -104,17 +107,22 @@ def save_debug_screenshot(sb, name: str):
         print(f"⚠️ 截图失败: {e}")
 
 
+def body_text(sb) -> str:
+    """页面可见文本（单行化）"""
+    try:
+        return " ".join((sb.get_text("body") or "").split())
+    except Exception:
+        return ""
+
+
 def get_cookie_info(sb, name: str):
     for c in sb.get_cookies():
         if c.get("name") == name:
-            value = c.get("value")
             expiry_ts = c.get("expiry")
             expiry_dt = (
-                datetime.fromtimestamp(expiry_ts, tz=timezone.utc)
-                if expiry_ts
-                else None
+                datetime.fromtimestamp(expiry_ts, tz=timezone.utc) if expiry_ts else None
             )
-            return value, expiry_dt
+            return c.get("value"), expiry_dt
     return None, None
 
 
@@ -125,8 +133,7 @@ def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3) -> b
         return True
     if expiry_dt:
         remaining = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
-        if remaining < days_threshold * 24 * 3600:
-            return True
+        return remaining < days_threshold * 24 * 3600
     return False
 
 
@@ -139,8 +146,10 @@ def update_github_secret(secret_name: str, new_value: str) -> bool:
         env = os.environ.copy()
         if GH_TOKEN:
             env["GH_TOKEN"] = GH_TOKEN
+        # 通过 stdin 传值，避免 Token 出现在进程参数里
         proc = subprocess.run(
-            ["gh", "secret", "set", secret_name, "--body", new_value],
+            ["gh", "secret", "set", secret_name],
+            input=new_value,
             capture_output=True,
             text=True,
             timeout=30,
@@ -176,7 +185,6 @@ def send_telegram_message(message: str):
 
 
 def format_duration(seconds: float) -> str:
-    """将秒数格式化为可读时长，如 1分23秒 / 45秒"""
     seconds = int(seconds)
     if seconds < 60:
         return f"{seconds}秒"
@@ -194,18 +202,8 @@ def format_notification(
     expiry_date: str = "",
     account: str = "",
 ) -> str:
-    script_duration = ""
-    if _START_TIME is not None:
-        script_duration = format_duration(time.time() - _START_TIME)
-
     display_account = mask_email(account or _ACCOUNT or EMAIL)
-
-    lines = [
-        "🇫🇮 Bot-hosting 续期通知",
-        "",
-        status,
-        f"👤 登录账户: {display_account}",
-    ]
+    lines = ["🇫🇮 Bot-hosting 续期通知", "", status, f"👤 登录账户: {display_account}"]
     if _LOGIN_METHOD != "SESSION_TOKEN":
         lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
     if expiry_date:
@@ -214,7 +212,6 @@ def format_notification(
         lines.append(extra)
     if error:
         lines.append(f"⚠️ 错误信息: {error}")
-    # 机器状态 / 运行时长
     if _SERVER_STATUS:
         status_map = {
             "running": "🟢 运行中",
@@ -225,8 +222,8 @@ def format_notification(
         lines.append(f"🖥️ 机器状态: {status_map.get(_SERVER_STATUS, _SERVER_STATUS)}")
     if _APP_UPTIME:
         lines.append(f"⏳ 运行时长: {_APP_UPTIME}")
-    if script_duration:
-        lines.append(f"🕒 脚本耗时: {script_duration}")
+    if _START_TIME is not None:
+        lines.append(f"🕒 脚本耗时: {format_duration(time.time() - _START_TIME)}")
     lines.append(f"⏱️ 执行时间: {now_cn()}")
     return "\n".join(lines)
 
@@ -235,8 +232,7 @@ def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
     indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     start = time.time()
     while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in indicators):
+        if not any(x in sb.get_page_source().lower() for x in indicators):
             print("✅ Turnstile 验证已通过")
             return True
         sb.sleep(1)
@@ -245,509 +241,314 @@ def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
 
 
 def get_current_ip(proxy_server: str = "") -> str:
-    proxies = None
-    if proxy_server:
-        proxies = {"http": proxy_server, "https": proxy_server}
+    proxies = {"http": proxy_server, "https": proxy_server} if proxy_server else None
     resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
     resp.raise_for_status()
     return resp.text.strip()
 
 
 def format_countdown(countdown_str: str) -> str:
-    """将 23:27:00 转为 23小时27分"""
+    """23:27:00 → 23小时27分"""
     try:
         h, m, _ = countdown_str.split(":")
         h, m = int(h), int(m)
-        if h > 0 and m > 0:
+        if h and m:
             return f"{h}小时{m}分"
-        if h > 0:
-            return f"{h}小时"
-        return f"{m}分"
+        return f"{h}小时" if h else f"{m}分"
     except Exception:
         return countdown_str
 
 
+# ==================== 页面信息提取 ====================
 def extract_expiry_date(page_source: str) -> str | None:
     patterns = [
         r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",
         r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
         r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",
         r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days",
-        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew manually to extend for 4 days",
     ]
     for pattern in patterns:
         match = re.search(pattern, page_source)
         if match:
-            date_str = match.group(1)
-            parts = date_str.split("/")
+            parts = match.group(1).split("/")
             # MM/DD/YYYY → YYYY/MM/DD
             if len(parts) == 3 and len(parts[0]) == 2 and len(parts[2]) == 4:
                 return f"{parts[2]}/{parts[0]}/{parts[1]}"
-            return date_str
+            return match.group(1)
     return None
 
 
 def extract_account_email(page_source: str) -> str | None:
-    """从页面中尽量提取登录邮箱/用户标识"""
-    emails = re.findall(
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-        page_source,
-    )
-    skip = {"example.com", "sentry.io", "w3.org", "github.com", "google.com",
-            "cloudflare.com", "discord.com", "bot-hosting.net"}
+    emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", page_source)
+    skip_domains = {
+        "example.com", "sentry.io", "w3.org", "github.com", "google.com",
+        "cloudflare.com", "discord.com", "bot-hosting.net",
+    }
     for e in emails:
-        domain = e.split("@")[-1].lower()
-        if domain in skip or e.lower().startswith("noreply"):
+        low = e.lower()
+        if low.split("@")[-1] in skip_domains:
             continue
-        if any(x in e.lower() for x in ["support@", "admin@", "no-reply", "noreply"]):
+        if any(x in low for x in ("support@", "admin@", "no-reply", "noreply")):
             continue
         return e
     m = re.search(r"(?:logged in as|welcome|user(?:name)?)[:\s]+([\w.#-]{2,32})", page_source, re.I)
-    if m:
-        return m.group(1)
+    return m.group(1) if m else None
+
+
+_UNIT = r"(?:d|h|m|s)(?![a-zA-Z])|天|小时|分|秒"
+_UPTIME_RE = re.compile(
+    r"(?:Running|Uptime\s*[:：]?|Online\s*[·•]|运行中\s*[·•]?)\s*"
+    rf"((?:\d+\s*(?:{_UNIT})\s*)+)",
+    re.I,
+)
+_PART_RE = re.compile(rf"(\d+)\s*({_UNIT})", re.I)
+_UNIT_SECONDS = {"d": 86400, "天": 86400, "h": 3600, "小时": 3600,
+                 "m": 60, "分": 60, "s": 1, "秒": 1}
+
+
+def extract_app_uptime(text: str) -> str | None:
+    """从可见文本提取 Running 1d 6h 7m 之类的时长，转为中文。超过 400 天视为异常。"""
+    for m in _UPTIME_RE.finditer(text):
+        total = 0
+        for num, unit in _PART_RE.findall(m.group(1)):
+            total += int(num) * _UNIT_SECONDS[unit.lower()]
+        if total <= 0:
+            continue
+        if total > 400 * 86400:
+            print(f"⚠️ 运行时长异常过大已丢弃: {m.group(1).strip()}")
+            continue
+        d, rem = divmod(total, 86400)
+        h, rem = divmod(rem, 3600)
+        mi, s = divmod(rem, 60)
+        parts = [f"{d}天" if d else "", f"{h}小时" if h else "",
+                 f"{mi}分" if mi else "", f"{s}秒" if s else ""]
+        return "".join(parts)
     return None
 
 
-def extract_app_uptime(page_source: str) -> str | None:
+def detect_server_status(text: str) -> str:
     """
-    从页面提取 Running / Uptime / Online 时长 → 中文。
-    规则（防误匹配）：
-    1. 只匹配紧跟在 Running / Uptime / Online • 后的「纯时长」片段
-    2. 整段必须只由 数字+单位(d/h/m/s 或 天/小时/分/秒) 组成，如 1m 10s、1d 6h 7m
-       排除 FREE-EU-RO-37、88.77 MiB 等
-    3. 折算超过 400 天的结果丢弃，返回 None（显示未知）
-    4. 不使用任何 API uptime / started_at 字段
+    基于页面可见文本判断：running / stopped / unknown
+    按钮文案 Stop / Start 不会被当成状态（Stopped 必须是完整单词）。
     """
-    # 捕获 Running / Uptime / Online 后的候选片段（限制长度，避免吞掉整段正文）
-    lead_patterns = [
-        r"Running\s+([0-9dhmsDHMS\s]{1,24})",
-        r"Uptime\s*[:：]?\s*([0-9dhmsDHMS\s]{1,24})",
-        r"Online\s*[·•]\s*([0-9dhmsDHMS\s]{1,24})",
-        r"运行中\s*[·•]?\s*([0-9天小时分秒\s]{1,24})",
-    ]
-
-    # 整段必须是纯时长：可选的 d/h/m/s 组合，至少有一个单位
-    pure_en = re.compile(
-        r"^\s*(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?\s*$",
-        re.I,
-    )
-    pure_zh = re.compile(
-        r"^\s*(?:(\d+)\s*天)?\s*(?:(\d+)\s*小时)?\s*(?:(\d+)\s*分)?\s*(?:(\d+)\s*秒)?\s*$",
-    )
-
-    def _parse_and_validate(raw: str) -> str | None:
-        raw = raw.strip()
-        if not raw:
-            return None
-        # 拒绝含小数点、字母混杂（除单位外）等
-        if re.search(r"[^0-9\sdhms天小时分秒]", raw, re.I):
-            return None
-
-        days = hours = mins = secs = 0
-        m = pure_en.match(raw)
-        if m and any(g is not None for g in m.groups()):
-            days = int(m.group(1) or 0)
-            hours = int(m.group(2) or 0)
-            mins = int(m.group(3) or 0)
-            secs = int(m.group(4) or 0)
-        else:
-            m = pure_zh.match(raw)
-            if not m or not any(g is not None for g in m.groups()):
-                return None
-            days = int(m.group(1) or 0)
-            hours = int(m.group(2) or 0)
-            mins = int(m.group(3) or 0)
-            secs = int(m.group(4) or 0)
-
-        # 至少有一个非零分量
-        if days + hours + mins + secs <= 0:
-            return None
-
-        total_days = days + hours / 24 + mins / 1440 + secs / 86400
-        if total_days > 400:
-            print(f"⚠️ 运行时长异常过大已丢弃: {raw} (约 {total_days:.1f} 天)")
-            return None
-
-        parts = []
-        if days:
-            parts.append(f"{days}天")
-        if hours:
-            parts.append(f"{hours}小时")
-        if mins:
-            parts.append(f"{mins}分")
-        if secs and not days:  # 有「天」时一般不再显示秒，更干净
-            parts.append(f"{secs}秒")
-        elif secs and not hours and not days:
-            parts.append(f"{secs}秒")
-        elif secs and (hours or days):
-            # 有小时/天时仍可保留秒，按需；这里保留
-            parts.append(f"{secs}秒")
-        return "".join(parts) if parts else None
-
-    for pat in lead_patterns:
-        for m in re.finditer(pat, page_source, re.I):
-            result = _parse_and_validate(m.group(1))
-            if result:
-                return result
-    return None
-
-
-def detect_server_status(page_source: str) -> str:
-    """
-    返回: running / stopped / offline / unknown
-    注意：页面上的 Stop/Start 按钮文案不能当作状态。
-    """
-    # 强信号：Running 后面跟时长数字（徽章）
-    if re.search(r"Running\s+\d+\s*[smhd]", page_source, re.I):
+    if re.search(r"Running\s+\d", text, re.I) or re.search(r"App is running", text, re.I):
         return "running"
-    if re.search(r"运行中\s*\d+", page_source):
+    if re.search(r"运行中\s*\d", text):
         return "running"
-    # 控制台常见文案
-    if re.search(r"App is running", page_source, re.I):
-        return "running"
-
-    # 强信号：状态徽章 Stopped / Offline（避免匹配按钮 Stop）
-    # 典型：>Stopped<  或  "Stopped" 作为独立状态词且附近无 Start 启用特征
-    if re.search(r"(?:status|badge|state)[^>]{0,40}stopped", page_source, re.I):
+    if re.search(r"\b(Stopped|Offline|Suspended)\b", text, re.I) or re.search(r"已停止|已关机|离线", text):
         return "stopped"
-    if re.search(r">\s*Stopped\s*<", page_source, re.I):
-        return "stopped"
-    if re.search(r">\s*Offline\s*<", page_source, re.I) or re.search(r"\bOffline\b", page_source):
-        # Offline 较少出现在按钮上
-        if not re.search(r"Running\s+\d", page_source, re.I):
-            return "offline"
-    if "已停止" in page_source or "已关机" in page_source:
-        return "stopped"
-    if "离线" in page_source and not re.search(r"Running\s+\d", page_source, re.I):
-        return "offline"
-
     return "unknown"
 
 
-def _click_start_button(sb) -> bool:
-    """点击开机/Start 按钮"""
-    selectors = [
-        'button:contains("Start")',
-        'button:contains("启动")',
-        'button:contains("开机")',
-        'a:contains("Start")',
-        '[aria-label*="Start" i]',
-        '[title*="Start" i]',
-    ]
-    for sel in selectors:
-        try:
-            if sb.is_element_visible(sel):
-                # 避免点到 Restart：文本刚好是 Start
-                text = ""
-                try:
-                    text = (sb.get_text(sel) or "").strip().lower()
-                except Exception:
-                    pass
-                if text and text not in ("start", "启动", "开机"):
-                    # 可能是 Restart / Start something else
-                    if "restart" in text or "重启" in text:
-                        continue
-                sb.click(sel)
-                print(f"✅ 已点击开机按钮: {sel} ({text or 'n/a'})")
-                return True
-        except Exception:
+# ==================== 服务器状态检测 / 开机 ====================
+def wait_page_ready(sb, timeout: int = 15) -> str:
+    """等待 SPA 渲染：出现状态词或 slots 字样即返回；超时也返回当前文本"""
+    end = time.time() + timeout
+    text = ""
+    while time.time() < end:
+        text = body_text(sb)
+        if detect_server_status(text) != "unknown" or re.search(r"\d+\s*/\s*\d+\s*slots", text, re.I):
+            sb.sleep(1.5)  # 卡片通常比 slots 文案晚一点
+            return body_text(sb)
+        sb.sleep(1)
+    return text
+
+
+def list_page_links(sb) -> list[dict]:
+    """返回页面所有同源链接，标注是否位于 nav/aside/header/footer 内"""
+    return sb.execute_script(r"""
+        return Array.from(document.querySelectorAll('a[href]')).map(a => {
+            let u;
+            try { u = new URL(a.getAttribute('href'), location.origin); } catch (e) { return null; }
+            if (u.origin !== location.origin) return null;
+            return {
+                text: (a.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 60),
+                href: u.pathname + u.search,
+                chrome: !!a.closest('nav, aside, header, footer, [role="navigation"]'),
+            };
+        }).filter(Boolean);
+    """) or []
+
+
+def find_server_link(sb) -> str | None:
+    """在主内容区找服务详情链接；优先 /a/d/<uuid>，其次带状态文字的卡片"""
+    # 0) 已知的服务页路径特征 /a/d/<uuid>
+    for link in list_page_links(sb):
+        if SERVER_PATH_RE.match(link["href"]):
+            return link["href"].split("?")[0]
+
+    # 1) 带状态文字的卡片 → 最近的 <a>
+    href = sb.execute_script(r"""
+        const re = /(Running\s+\d|Stopped|Offline|Suspended|运行中|已停止)/i;
+        for (const el of document.querySelectorAll('main *, body *')) {
+            if (el.children.length > 8) continue;
+            const t = (el.innerText || '').trim();
+            if (!t || t.length > 200 || !re.test(t)) continue;
+            if (el.closest('nav, aside, header, footer')) continue;
+            const a = el.closest('a[href]') || el.parentElement?.closest('a[href]');
+            if (a) return new URL(a.getAttribute('href'), location.origin).pathname;
+        }
+        return null;
+    """)
+    if href:
+        return href
+
+    # 2) 主内容区里路径不在黑名单的 /a/... 链接
+    for link in list_page_links(sb):
+        if link["chrome"]:
             continue
+        segs = [s for s in link["href"].split("?")[0].split("/") if s]
+        if not segs or segs[0] != "a" or len(segs) < 2:
+            continue
+        if segs[1].lower() in NON_SERVER_SEGMENTS:
+            continue
+        return link["href"]
+    return None
 
-    # JS 兜底：找文本精确为 Start 的按钮
+
+def click_start_button(sb) -> bool:
+    """只点文案精确为 Start / 启动 / 开机 的按钮（排除 Restart）"""
     try:
         clicked = sb.execute_script(r"""
-            const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-            for (const n of nodes) {
+            const ok = new Set(['start', '启动', '开机']);
+            for (const n of document.querySelectorAll('button, a, [role="button"]')) {
+                if (n.disabled || n.closest('nav, aside, header, footer')) continue;
                 const t = (n.innerText || n.textContent || '').trim().toLowerCase();
-                if (t === 'start' || t === '启动' || t === '开机') {
-                    n.click();
-                    return true;
-                }
+                if (ok.has(t)) { n.click(); return t; }
             }
-            return false;
+            return null;
         """)
         if clicked:
-            print("✅ 已通过 JS 点击 Start")
+            print(f"✅ 已点击开机按钮: {clicked}")
             return True
     except Exception as e:
-        print(f"⚠️ JS 点击 Start 失败: {e}")
+        print(f"⚠️ 点击 Start 失败: {e}")
     return False
 
 
-def open_first_deployment(sb) -> bool:
-    """从 Overview 进入部署/服务详情，严禁跳到 Credits/Billing/Settings 等。"""
-    before = sb.get_current_url()
-    try:
-        clicked = sb.execute_script(r"""
-            const skipRe = /billings?|credits?|affiliation|templates?|settings?|login|account|docs|pricing|changelog|support|discord|status|advertise|knowledge/i;
-            const goodRe = /deploy|project|fleet|server|manage|console|app/i;
-            const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="project"], [class*="deploy"], [class*="item"]'));
-
-            // 0) 明确的「Skip to deployments」无障碍链接
-            for (const n of nodes) {
-                const t = (n.innerText || n.textContent || '').trim().toLowerCase();
-                if (t.includes('skip to deployment') || t === 'deployments') {
-                    n.click();
-                    return 'skip-deployments';
-                }
-            }
-
-            // 1) 带 Running/Stopped 状态的卡片
-            for (const n of nodes) {
-                const t = (n.innerText || n.textContent || '');
-                if (/Running[\s]+\d/i.test(t) || />?\s*Stopped\s*</i.test(t) || /运行中\s*\d/.test(t)) {
-                    const href = (n.getAttribute && n.getAttribute('href')) || '';
-                    if (href && skipRe.test(href)) continue;
-                    n.click();
-                    return 'status-card';
-                }
-            }
-
-            // 2) href 像部署详情，且不是 credits/settings
-            const cur = (location.pathname.replace(/\/$/, '') || '/');
-            const scored = [];
-            for (const n of nodes) {
-                const href = (n.getAttribute && n.getAttribute('href')) || '';
-                if (!href || skipRe.test(href)) continue;
-                try {
-                    const u = new URL(href, location.origin);
-                    if (u.origin !== location.origin) continue;
-                    const path = u.pathname.replace(/\/$/, '') || '/';
-                    if (path === cur || path === '/a' || path === '/') continue;
-                    if (skipRe.test(path)) continue;
-                    let score = 0;
-                    if (goodRe.test(path) || goodRe.test(href)) score += 5;
-                    if (/\/a\/[^/]+/.test(path) && path.split('/').length >= 3) score += 3;
-                    const t = (n.innerText || n.textContent || '').trim();
-                    if (/^myapp$/i.test(t) || /deploy/i.test(t)) score += 4;
-                    if (score > 0) scored.push({n, score, href, t: t.slice(0, 40)});
-                } catch (e) {}
-            }
-            scored.sort((a, b) => b.score - a.score);
-            if (scored.length) {
-                scored[0].n.click();
-                return scored[0].href + '|' + scored[0].t;
-            }
-
-            // 3) 按钮/链接文案
-            for (const n of nodes) {
-                const t = (n.innerText || n.textContent || '').trim().toLowerCase();
-                if (['manage', 'open', '管理', '打开', 'console', 'deploy'].includes(t)) {
-                    const href = (n.getAttribute && n.getAttribute('href')) || '';
-                    if (href && skipRe.test(href)) continue;
-                    n.click();
-                    return t;
-                }
-            }
-            return false;
-        """)
-        if clicked:
-            sb.sleep(4)
-            sb.wait_for_ready_state_complete()
-            after = sb.get_current_url()
-            print(f"➡️ 进入服务页: {clicked} | {before} -> {after}")
-            # 若误进 credits/settings，视为失败
-            if re.search(r"credits|affiliation|templates|settings|billing", after, re.I):
-                print(f"⚠️ 误入无关页面，放弃: {after}")
-                return False
-            if after == before:
-                sb.sleep(3)
-            return True
-    except Exception as e:
-        print(f"⚠️ 进入服务页失败: {e}")
-    return False
+def dump_debug(sb, tag: str):
+    """定位问题用：完整文本 + 全部链接 + 截图"""
+    print(f"📄 [{tag}] URL: {sb.get_current_url()}")
+    print(f"📄 [{tag}] 文本: {body_text(sb)[:1200]}")
+    links = [f"{'(nav) ' if l['chrome'] else ''}{l['text']} -> {l['href']}" for l in list_page_links(sb)]
+    print(f"🔗 [{tag}] 链接({len(links)}): " + " | ".join(links[:40]))
+    save_debug_screenshot(sb, tag)
 
 
-def page_has_power_controls(page_source: str) -> bool:
-    """是否在服务详情页（有 Start/Stop/Kill/Restart 控制条）"""
-    lower = page_source.lower()
-    has_stop = bool(re.search(r">\s*stop\s*<", lower) or re.search(r"\bkill\b", lower))
-    has_start = bool(re.search(r">\s*start\s*<", lower) or re.search(r">\s*restart\s*<", lower))
-    return has_stop or has_start
+def read_state(sb) -> tuple[str, str, str]:
+    text = wait_page_ready(sb)
+    return detect_server_status(text), extract_app_uptime(text) or "", text
 
 
 def check_and_manage_server(sb) -> tuple[str, str]:
     """
-    检测机器状态：
-      - running  → 记录运行时长，跳过开机
-      - stopped/offline → 仅在服务详情页执行开机
-    返回 (status, uptime_str)
+    返回 (status, uptime)
+    status: running / started / start_failed / unknown
+    - running  → 记录时长
+    - stopped  → 点 Start
+    - unknown  → 不操作，仅记录并输出调试信息
     """
-    status = "unknown"
-    uptime = ""
+    start_url = SERVER_URL or f"{BASE}/a/"
+    sb.open(start_url)
+    sb.wait_for_ready_state_complete()
+    st, up, text = read_state(sb)
+    print(f"📊 {'服务页' if SERVER_URL else '总览页'}状态: {st}, 时长: {up or '无'}")
+    print(f"📄 页面文本: {text[:300]}")
 
-    # 优先尝试更可能的部署相关路径
-    candidate_urls = [
-        "https://bot-hosting.net/a/",
-        "https://bot-hosting.net/a/deployments",
-        "https://bot-hosting.net/a/projects",
-        "https://bot-hosting.net/",
-    ]
+    if st == "running" or up:
+        return "running", up
 
-    for url in candidate_urls:
-        try:
-            print(f"🌐 访问: {url}")
-            sb.open(url)
-            sb.wait_for_ready_state_complete()
-            sb.sleep(5)
-        except Exception as e:
-            print(f"⚠️ 访问失败: {e}")
-            continue
-
-        src = sb.get_page_source()
-        st = detect_server_status(src)
-        up = extract_app_uptime(src) or ""
-        print(f"📊 页面状态: {st}, 时长: {up or '无'}")
-        try:
-            body_text = sb.get_text("body") or ""
-            snippet = " ".join(body_text.split())[:400]
-            print(f"📄 页面摘要: {snippet}")
-        except Exception:
-            pass
-
+    # 总览页没有状态 → 进入服务详情页
+    if st == "unknown":
+        href = find_server_link(sb)
+        if not href:
+            print("⚠️ 未找到服务器链接")
+            dump_debug(sb, "no_server_link")
+            return "unknown", ""
+        print(f"➡️ 进入服务页: {href}")
+        sb.open(BASE + href)
+        sb.wait_for_ready_state_complete()
+        st, up, text = read_state(sb)
+        print(f"📊 服务页状态: {st}, 时长: {up or '无'}")
+        print(f"📄 服务页文本: {text[:300]}")
         if st == "running" or up:
-            return ("running", up)
+            return "running", up
 
-        # 从 Overview 点进具体部署
-        if open_first_deployment(sb):
-            src = sb.get_page_source()
-            st = detect_server_status(src)
-            up = extract_app_uptime(src) or ""
-            print(f"📊 服务页状态: {st}, 时长: {up or '无'}")
-            try:
-                body_text = sb.get_text("body") or ""
-                snippet = " ".join(body_text.split())[:400]
-                print(f"📄 服务页摘要: {snippet}")
-            except Exception:
-                pass
+    if st != "stopped":
+        print("⚠️ 状态无法确认，不执行开机")
+        dump_debug(sb, "status_unknown")
+        return "unknown", ""
 
-            if st == "running" or up:
-                return ("running", up)
+    # 明确未运行 → 开机
+    print("🔌 检测到未运行，尝试开机...")
+    if not click_start_button(sb):
+        print("⚠️ 未找到 Start 按钮")
+        dump_debug(sb, "no_start_btn")
+        return "start_failed", ""
 
-            # 只有确认在控制台详情页时才尝试开机
-            if page_has_power_controls(src):
-                if st in ("stopped", "offline", "unknown"):
-                    print("🔌 服务详情页未运行，尝试开机...")
-                    if _click_start_button(sb):
-                        sb.sleep(8)
-                        sb.wait_for_ready_state_complete()
-                        src2 = sb.get_page_source()
-                        up2 = extract_app_uptime(src2) or ""
-                        st2 = detect_server_status(src2)
-                        if st2 == "running" or up2:
-                            print(f"✅ 开机成功，运行时长: {up2 or '启动中'}")
-                            return ("started", up2 or "启动中")
-                        sb.sleep(5)
-                        src3 = sb.get_page_source()
-                        up3 = extract_app_uptime(src3) or ""
-                        if up3 or detect_server_status(src3) == "running":
-                            print(f"✅ 开机成功，运行时长: {up3 or '启动中'}")
-                            return ("started", up3 or "启动中")
-                        print("⚠️ 已点 Start，但状态仍未变为 Running")
-                        save_debug_screenshot(sb, "start_pending")
-                        return ("start_failed", "")
-                    else:
-                        print("⚠️ 未找到 Start 按钮")
-                        save_debug_screenshot(sb, "no_start_btn")
-                        return ("start_failed", "")
-            else:
-                print("ℹ️ 当前页无 Start/Stop 控制条，跳过开机（可能仍在列表页）")
-
-        # 当前页本身就是详情页
-        if page_has_power_controls(src) and st in ("stopped", "offline"):
-            print("🔌 详情页显示未运行，尝试开机...")
-            if _click_start_button(sb):
-                sb.sleep(8)
-                src2 = sb.get_page_source()
-                up2 = extract_app_uptime(src2) or ""
-                if up2 or detect_server_status(src2) == "running":
-                    return ("started", up2 or "启动中")
-                return ("start_failed", "")
-
-    return (status, uptime)
+    for _ in range(4):  # 最多等待约 30 秒
+        sb.sleep(7)
+        text = body_text(sb)
+        up = extract_app_uptime(text) or ""
+        if up or detect_server_status(text) == "running":
+            print(f"✅ 开机成功，运行时长: {up or '启动中'}")
+            return "started", up or "启动中"
+    print("⚠️ 已点 Start，但状态仍未变为 Running")
+    save_debug_screenshot(sb, "start_pending")
+    return "start_failed", ""
 
 
-# ==================== Discord OAuth ====================
-# ==================== Discord OAuth ====================
 # ==================== Discord OAuth ====================
 def capture_discord_state(sb) -> str:
     print("🔎 获取 Discord OAuth state...")
-    sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", reconnect_time=4)
+    sb.uc_open_with_reconnect(f"{BASE}/login/discord", reconnect_time=4)
     sb.sleep(2)
 
     url = sb.get_current_url()
     if "discord.com" not in url:
         print(f"⚠️ 未跳转到 Discord 页面，当前 URL：{url}")
         return ""
-
     m = STATE_RE.search(url)
     if not m:
-        print(f"❌ 未能解析 state，当前 URL：{url}")
+        print("❌ 未能解析 state")
         return ""
-
-    state = urllib.parse.unquote(m.group(1))
-    print(f"✅ 已捕获 state")
-    return state
+    print("✅ 已捕获 state")
+    return urllib.parse.unquote(m.group(1))
 
 
 def discord_authorize(state: str) -> str:
-    query = urllib.parse.urlencode(
-        {
-            "client_id": DISCORD_CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": OAUTH_REDIRECT_URI,
-            "scope": OAUTH_SCOPE,
-            "state": state,
-        }
-    )
-    authorize_url = f"{DISCORD_API}?{query}"
-
-    referer = (
-        "https://discord.com/oauth2/authorize?"
-        + urllib.parse.urlencode(
-            {
-                "client_id": DISCORD_CLIENT_ID,
-                "redirect_uri": OAUTH_REDIRECT_URI,
-                "response_type": "code",
-                "scope": OAUTH_SCOPE,
-                "state": state,
-            }
-        )
-    )
-
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "scope": OAUTH_SCOPE,
+        "state": state,
+    }
+    query = urllib.parse.urlencode(params)
     headers = {
         "accept": "*/*",
         "authorization": DC_TOKEN,
         "content-type": "application/json",
         "origin": "https://discord.com",
-        "referer": referer,
+        "referer": "https://discord.com/oauth2/authorize?" + query,
         "user-agent": DISCORD_UA,
         "x-discord-locale": "zh-CN",
     }
-
-    body = json.dumps(
-        {
-            "permissions": "0",
-            "authorize": True,
-            "integration_type": 0,
-            "location_context": {
-                "guild_id": "10000",
-                "channel_id": "10000",
-                "channel_type": 10000,
-            },
-        }
-    )
+    body = json.dumps({
+        "permissions": "0",
+        "authorize": True,
+        "integration_type": 0,
+        "location_context": {"guild_id": "10000", "channel_id": "10000", "channel_type": 10000},
+    })
 
     proxies = None
-    is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    if is_proxy:
+    if os.environ.get("IS_PROXY", "false").lower() == "true":
+        proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
         proxies = {"http": proxy_server, "https": proxy_server}
 
     try:
         resp = requests.post(
-            authorize_url, headers=headers, data=body, proxies=proxies, timeout=20
+            f"{DISCORD_API}?{query}", headers=headers, data=body, proxies=proxies, timeout=20
         )
         if resp.status_code != 200:
             print(f"❌ Discord OAuth 失败: HTTP {resp.status_code} - {resp.text[:300]}")
@@ -761,15 +562,12 @@ def discord_authorize(state: str) -> str:
     if not location:
         print(f"❌ 授权响应无 location: {data}")
         return ""
-
-    masked = re.sub(r"code=[^&]+", "code=***", location)
-    print(f"✅ 拿到回调 URL: {masked}")
+    print(f"✅ 拿到回调 URL: {re.sub(r'code=[^&]+', 'code=***', location)}")
     return location
 
 
 def do_discord_login(sb) -> bool:
     print("\n🔑 通过 Discord Token 登录...")
-
     state = capture_discord_state(sb)
     if not state:
         save_debug_screenshot(sb, "login_no_state")
@@ -784,22 +582,15 @@ def do_discord_login(sb) -> bool:
     sb.sleep(3)
 
     url = sb.get_current_url()
-
     if "/error/banned" in url:
         print("🚫 账号已被封禁")
         save_debug_screenshot(sb, "login_banned")
         return False
-
     if "bot-hosting.net" not in url:
         print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{url}")
         save_debug_screenshot(sb, "login_no_redirect")
         return False
-
-    try:
-        body_text = sb.get_text("body")
-    except Exception:
-        body_text = ""
-    if "fraud" in body_text.lower():
+    if "fraud" in body_text(sb).lower():
         print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
         save_debug_screenshot(sb, "login_fraud")
         return False
@@ -807,11 +598,7 @@ def do_discord_login(sb) -> bool:
     for _ in range(40):
         url = sb.get_current_url()
         path = urllib.parse.urlparse(url).path
-        if (
-            "bot-hosting.net" in url
-            and path != "/login"
-            and not path.startswith("/login/discord")
-        ):
+        if "bot-hosting.net" in url and path != "/login" and not path.startswith("/login/discord"):
             print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
             return True
         sb.sleep(0.5)
@@ -822,93 +609,79 @@ def do_discord_login(sb) -> bool:
 
 
 # ==================== 续期核心 ====================
+COUNTDOWN_RE = re.compile(r"Renew in (\d{2}:\d{2}:\d{2})")
+
+
 def find_renew_button(sb):
-    """返回 (outer_selector, countdown_text)"""
-    possible = [
+    """返回 (selector, countdown)；二者至多一个非 None"""
+    selectors = [
         'button:contains("Renew")',
-        'button:contains("Renew free plan")',
         'a:contains("Renew")',
         '[class*="renew"]',
         '[class*="Renew"]',
     ]
-    for selector in possible:
+    for selector in selectors:
         try:
-            if sb.is_element_visible(selector):
-                text = sb.get_text(selector)
-                if "Renew in" in text:
-                    m = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", text)
-                    if m:
-                        return None, m.group(1)
-                elif "Renew" in text and "in" not in text.lower():
-                    print(f"✅ 续期按钮可用: '{text}'")
-                    return selector, None
+            if not sb.is_element_visible(selector):
+                continue
+            text = sb.get_text(selector)
+            m = COUNTDOWN_RE.search(text)
+            if m:
+                return None, m.group(1)
+            if "Renew" in text:
+                print(f"✅ 续期按钮可用: '{text}'")
+                return selector, None
         except Exception:
             continue
     return None, None
 
 
+def notify(status, **kw):
+    send_telegram_message(format_notification(status, **kw))
+
+
 def do_renew(sb, current_expiry: str | None) -> bool:
+    expiry_text = current_expiry or "（未获取到）"
     outer_selector, countdown_text = find_renew_button(sb)
 
     if not outer_selector:
         if countdown_text:
             friendly = format_countdown(countdown_text)
             print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
-            send_telegram_message(
-                format_notification(
-                    "⏳ 未到续期时间",
-                    extra=f"⏱️ 可续期时间: {friendly}后",
-                    expiry_date=current_expiry or "（未获取到）",
-                )
-            )
+            notify("⏳ 未到续期时间", extra=f"⏱️ 可续期时间: {friendly}后", expiry_date=expiry_text)
         else:
             print("ℹ️ 未找到续期按钮或倒计时")
-            send_telegram_message(
-                format_notification(
-                    "ℹ️ 无需续期 / 状态未知",
-                    extra="请手动检查后台",
-                    expiry_date=current_expiry or "（未获取到）",
-                )
-            )
+            notify("ℹ️ 无需续期 / 状态未知", extra="请手动检查后台", expiry_date=expiry_text)
         return False
 
     print("🔄 点击外部续期按钮...")
     try:
         sb.click(outer_selector)
-        # 等待模态框出现（最多 20 秒）
         sb.wait_for_element_visible('button:contains("Renew for 4 days")', timeout=20)
     except Exception as e:
         print(f"❌ 点击外部按钮或等待模态框失败: {e}")
         save_debug_screenshot(sb, "renew_click_fail")
-        send_telegram_message(
-            format_notification("❌ 续期失败", error="点击外部续期按钮或模态框超时")
-        )
+        notify("❌ 续期失败", error="点击外部续期按钮或模态框超时")
         return False
 
-    # Turnstile 处理（最多 3 次）
     print("🔒 处理 Turnstile 验证...")
-    turnstile_passed = False
+    passed = False
     for attempt in range(1, 4):
         try:
             sb.uc_gui_click_captcha()
             sb.sleep(8)
         except Exception as e:
             print(f"⚠️ 第 {attempt} 次点击 Turnstile 出错: {e}")
-
         if wait_for_turnstile_pass(sb, timeout=18):
-            turnstile_passed = True
+            passed = True
             break
         print(f"⏳ 第 {attempt} 次未通过，重试...")
 
-    if not turnstile_passed:
-        print("❌ Turnstile 最终未通过")
+    if not passed:
         save_debug_screenshot(sb, "turnstile_fail")
-        send_telegram_message(
-            format_notification("❌ 续期失败", error="Turnstile 验证未通过")
-        )
+        notify("❌ 续期失败", error="Turnstile 验证未通过")
         return False
 
-    # 点击最终续期按钮
     print("⏳ 点击「Renew for 4 days」...")
     try:
         sb.click('button:contains("Renew for 4 days")', timeout=10)
@@ -916,70 +689,52 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     except Exception as e:
         print(f"❌ 点击续期按钮失败: {e}")
         save_debug_screenshot(sb, "renew_confirm_fail")
-        send_telegram_message(
-            format_notification("❌ 续期失败", error="点击最终续期按钮失败")
-        )
+        notify("❌ 续期失败", error="点击最终续期按钮失败")
         return False
 
-    # 等待结果
     sb.sleep(6)
     new_page = sb.get_page_source()
     new_expiry = extract_expiry_date(new_page)
-    new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page)
+    new_match = COUNTDOWN_RE.search(new_page)
 
     if new_match:
-        new_countdown = new_match.group(1)
-        print(f"✅ 续期成功！新倒计时: {new_countdown}")
-        if new_expiry:
-            print(f"📅 新到期日期: {new_expiry}")
-        send_telegram_message(
-            format_notification(
-                "✅ 续期成功",
-                extra=f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
-                expiry_date=new_expiry or "（未获取到）",
-            )
-        )
+        cd = new_match.group(1)
+        print(f"✅ 续期成功！新倒计时: {cd}")
+        notify("✅ 续期成功", extra=f"⏱️ 可续期时间: {format_countdown(cd)}后",
+               expiry_date=new_expiry or "（未获取到）")
         return True
 
     if new_expiry and new_expiry != current_expiry:
         print(f"✅ 续期成功，到期日期更新为: {new_expiry}")
-        send_telegram_message(
-            format_notification(
-                "✅ 续期成功",
-                extra="到期日期已更新",
-                expiry_date=new_expiry,
-            )
-        )
+        notify("✅ 续期成功", extra="到期日期已更新", expiry_date=new_expiry)
         return True
 
     print("⚠️ 续期结果未知，到期日期未明显变化")
     save_debug_screenshot(sb, "renew_result_unknown")
-    send_telegram_message(
-        format_notification(
-            "⚠️ 续期可能未成功",
-            extra="请登录后台检查",
-            expiry_date=current_expiry or "（未获取到）",
-        )
-    )
+    notify("⚠️ 续期可能未成功", extra="请登录后台检查", expiry_date=expiry_text)
     return False
 
 
 # ==================== 主流程 ====================
+def goto_billings(sb) -> bool:
+    sb.open(BILLINGS_URL)
+    sb.wait_for_ready_state_complete()
+    sb.sleep(2)
+    url = sb.get_current_url()
+    return "/a/billings" in url and "/login" not in url and "error=" not in url
+
+
 def main():
-    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS
+    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD
     _START_TIME = time.time()
-    _ACCOUNT = ""
-    _APP_UPTIME = ""
-    _SERVER_STATUS = ""
+    _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
     print("   Bot-hosting 自动续期 v2.7")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_server = (
-        os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    )
+    proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
 
     sb_kwargs = {"uc": True, "headless": headless}
@@ -989,12 +744,9 @@ def main():
     else:
         print("🍭 未使用代理，直连访问")
 
-    global _LOGIN_METHOD
-
     with SB(**sb_kwargs) as sb:
         try:
-            ip = get_current_ip(proxy_server if is_proxy else "")
-            print(f"📍 当前出口 IP: {ip}")
+            print(f"📍 当前出口 IP: {get_current_ip(proxy_server if is_proxy else '')}")
         except Exception as e:
             print(f"⚠️ 获取出口 IP 失败: {e}")
 
@@ -1003,33 +755,18 @@ def main():
         # ---------- 方式1：SESSION_TOKEN ----------
         if SESSION_TOKEN:
             print("🚀 启动浏览器并注入 Cookie...")
-            sb.open("https://bot-hosting.net/")
+            sb.open(f"{BASE}/")
             sb.wait_for_ready_state_complete()
             sb.sleep(1.5)
-
             for name, value in COOKIES.items():
                 if value:
-                    sb.add_cookie(
-                        {"name": name, "value": value, "domain": "bot-hosting.net"}
-                    )
-
-            print("🌐 访问账单页...")
-            sb.open("https://bot-hosting.net/a/billings")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(2)
-
-            current_url = sb.get_current_url()
-            print(f"📝 当前 URL: {current_url}")
-
-            if (
-                "/a/billings" in current_url
-                and "/login" not in current_url
-                and "error=" not in current_url
-            ):
-                login_ok = True
+                    sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
+            login_ok = goto_billings(sb)
+            print(f"📝 当前 URL: {sb.get_current_url()}")
+            if login_ok:
                 print("✅ SESSION_TOKEN 登录成功")
             else:
-                print(f"❌ SESSION_TOKEN 登录失败")
+                print("❌ SESSION_TOKEN 登录失败")
                 save_debug_screenshot(sb, "session_login_fail")
 
         # ---------- 方式2：Discord OAuth ----------
@@ -1037,68 +774,62 @@ def main():
             _LOGIN_METHOD = "Discord Token"
             print("\n🔄 尝试 Discord OAuth 登录...")
             if do_discord_login(sb):
-                sb.open("https://bot-hosting.net/a/billings")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(2)
-                current_url = sb.get_current_url()
-                if "a/billings" in current_url:
-                    login_ok = True
+                login_ok = goto_billings(sb)
+                if login_ok:
                     print("✅ Discord OAuth 登录成功")
                 else:
-                    print(f"❌ 登录后仍未到达账单页: {current_url}")
+                    print(f"❌ 登录后仍未到达账单页: {sb.get_current_url()}")
                     save_debug_screenshot(sb, "discord_billings_fail")
             else:
                 print("❌ Discord OAuth 登录失败")
 
         if not login_ok:
-            error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
-            if not SESSION_TOKEN and DC_TOKEN:
+            if not SESSION_TOKEN:
                 error_msg = "Discord OAuth 登录失败"
-            elif SESSION_TOKEN and not DC_TOKEN:
+            elif not DC_TOKEN:
                 error_msg = "SESSION_TOKEN 失效且未配置 Discord Token"
-            send_telegram_message(format_notification("❌ 登录失败", error=error_msg))
+            else:
+                error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
+            notify("❌ 登录失败", error=error_msg)
             return
 
-        if _LOGIN_METHOD == "Discord Token":
-            print("ℹ️ 本次使用 Discord 登录，将尝试更新 SESSION_TOKEN")
-
-        # ---------- 提取到期日期 & 登录账号 ----------
+        # ---------- 到期日期 & 账号 ----------
         sb.sleep(1.5)
         page_source = sb.get_page_source()
         current_expiry = extract_expiry_date(page_source)
-        if current_expiry:
-            print(f"📅 当前到期日期: {current_expiry}")
-        else:
-            print("⚠️ 未能提取当前到期日期")
+        print(f"📅 当前到期日期: {current_expiry}" if current_expiry else "⚠️ 未能提取当前到期日期")
 
         _ACCOUNT = extract_account_email(page_source) or ""
         if _ACCOUNT:
-            print(f"👤 登录账号: {_ACCOUNT}")
+            print(f"👤 登录账号: {mask_email(_ACCOUNT)}")
         else:
             print("⚠️ 未能从页面提取登录账号，将使用 EMAIL Secret")
 
-        # ---------- 检测机器状态：运行中跳过，关机则开机 ----------
+        # ---------- 机器状态：运行中跳过，明确关机才开机 ----------
         print("🔎 检测机器状态...")
-        _SERVER_STATUS, _APP_UPTIME = check_and_manage_server(sb)
+        try:
+            _SERVER_STATUS, _APP_UPTIME = check_and_manage_server(sb)
+        except Exception as e:
+            print(f"⚠️ 机器状态检测异常: {e}")
+            save_debug_screenshot(sb, "server_check_error")
+            _SERVER_STATUS, _APP_UPTIME = "unknown", ""
+
         if _SERVER_STATUS == "running":
             print(f"✅ 机器运行中，运行时长: {_APP_UPTIME or '未知'}")
         elif _SERVER_STATUS == "started":
             print(f"✅ 已执行开机，运行时长: {_APP_UPTIME or '启动中'}")
         elif _SERVER_STATUS == "start_failed":
-            print("❌ 开机失败或未找到 Start 按钮")
-            save_debug_screenshot(sb, "server_start_fail")
+            print("❌ 开机失败")
         else:
             print("⚠️ 未能确认机器状态")
 
-        # 回到账单页，保证后续续期逻辑正常
+        # ---------- 回账单页并续期 ----------
         try:
-            sb.open("https://bot-hosting.net/a/billings")
+            sb.open(BILLINGS_URL)
             sb.wait_for_ready_state_complete()
             sb.sleep(1.5)
         except Exception:
             pass
-
-        # ---------- 执行续期 ----------
         do_renew(sb, current_expiry)
 
         # ---------- 更新 SESSION_TOKEN ----------
@@ -1113,7 +844,6 @@ def main():
                     print("⚠️ 更新失败，请检查 GH_TOKEN 权限")
             else:
                 print("⚠️ 未设置 GH_TOKEN，无法自动更新")
-                print(f"📋 请手动设置 SESSION_TOKEN = {mask_token(new_token)}")
         else:
             print("✅ SESSION_TOKEN 无需更新")
 
