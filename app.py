@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.2
+Bot-hosting Auto Renew v2.3
 优化点：
 - 显式等待替代硬编码 sleep
 - 更稳健的元素定位与到期日期解析
@@ -9,7 +9,9 @@ Bot-hosting Auto Renew v2.2
 - 时区用 zoneinfo
 - 登录 / 续期 / 更新 Token 逻辑更清晰
 - 代理与 IP 检测更友好
-- TG 通知：邮箱脱敏 a***a@mail.com + 运行时长\n- 自动提取登录账号；倒计时改为「小时/分」
+- TG 通知：邮箱脱敏 a***a@mail.com
+- 自动提取登录账号；倒计时「小时/分」
+- 运行时长 = 面板 App Running 时间；脚本耗时单独显示
 """
 
 import os
@@ -51,8 +53,9 @@ COOKIES = {
 }
 
 _LOGIN_METHOD = "SESSION_TOKEN"
-_START_TIME = None  # 脚本启动时间，用于计算运行时长
-_ACCOUNT = ""  # 登录后从页面提取的账号
+_START_TIME = None  # 脚本启动时间
+_ACCOUNT = ""       # 登录后从页面提取的账号
+_APP_UPTIME = ""    # 面板上 App 的 Running 时长（服务器运行时间）
 TZ_CN = ZoneInfo("Asia/Shanghai")
 
 # Discord OAuth 常量
@@ -190,11 +193,10 @@ def format_notification(
     expiry_date: str = "",
     account: str = "",
 ) -> str:
-    duration_str = ""
+    script_duration = ""
     if _START_TIME is not None:
-        duration_str = format_duration(time.time() - _START_TIME)
+        script_duration = format_duration(time.time() - _START_TIME)
 
-    # 优先：传入的 account > 页面提取的 _ACCOUNT > Secrets EMAIL
     display_account = mask_email(account or _ACCOUNT or EMAIL)
 
     lines = [
@@ -211,8 +213,11 @@ def format_notification(
         lines.append(extra)
     if error:
         lines.append(f"⚠️ 错误信息: {error}")
-    if duration_str:
-        lines.append(f"⏳ 运行时长: {duration_str}")
+    # 运行时长 = 面板上 App 的 Running 时间（服务器运行时间）
+    if _APP_UPTIME:
+        lines.append(f"⏳ 运行时长: {_APP_UPTIME}")
+    if script_duration:
+        lines.append(f"🕒 脚本耗时: {script_duration}")
     lines.append(f"⏱️ 执行时间: {now_cn()}")
     return "\n".join(lines)
 
@@ -276,7 +281,6 @@ def extract_expiry_date(page_source: str) -> str | None:
 
 def extract_account_email(page_source: str) -> str | None:
     """从页面中尽量提取登录邮箱/用户标识"""
-    # 优先匹配常见邮箱
     emails = re.findall(
         r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
         page_source,
@@ -287,15 +291,113 @@ def extract_account_email(page_source: str) -> str | None:
         domain = e.split("@")[-1].lower()
         if domain in skip or e.lower().startswith("noreply"):
             continue
-        # 过滤明显不是用户邮箱的
         if any(x in e.lower() for x in ["support@", "admin@", "no-reply", "noreply"]):
             continue
         return e
-    # 备选：Discord 用户名类
     m = re.search(r"(?:logged in as|welcome|user(?:name)?)[:\s]+([\w.#-]{2,32})", page_source, re.I)
     if m:
         return m.group(1)
     return None
+
+
+def extract_app_uptime(page_source: str) -> str | None:
+    """
+    从面板提取 App 运行时长，例如：
+    Running 32m 57s  →  32分57秒
+    Running 1h 5m    →  1小时5分
+    Running 2d 3h    →  2天3小时
+    """
+    # 常见格式：Running 32m 57s / Running 1h 12m 5s / Running 2d 4h
+    patterns = [
+        r"Running\s+((?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)",
+        r"运行中\s*[·•]?\s*((?:\d+天\s*)?(?:\d+小时\s*)?(?:\d+分\s*)?(?:\d+秒)?)",
+        r"Uptime[:\s]+((?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)",
+    ]
+    raw = None
+    for pat in patterns:
+        m = re.search(pat, page_source, re.I)
+        if m:
+            raw = m.group(1).strip()
+            if raw:
+                break
+    if not raw:
+        return None
+
+    # 已是中文则直接返回
+    if any(x in raw for x in ("天", "小时", "分", "秒")):
+        return raw.replace(" ", "")
+
+    # 英文单位转中文
+    raw = raw.lower().replace(" ", "")
+    out = raw
+    out = re.sub(r"(\d+)d", r"\1天", out)
+    out = re.sub(r"(\d+)h", r"\1小时", out)
+    out = re.sub(r"(\d+)m", r"\1分", out)
+    out = re.sub(r"(\d+)s", r"\1秒", out)
+    return out if out else None
+
+
+def fetch_app_uptime(sb) -> str:
+    """尝试从控制台/服务页抓取 App Running 时长"""
+    def _from_src(src: str) -> str:
+        return extract_app_uptime(src) or ""
+
+    try:
+        up = _from_src(sb.get_page_source())
+        if up:
+            return up
+    except Exception:
+        pass
+
+    candidate_urls = [
+        "https://bot-hosting.net/a/",
+        "https://bot-hosting.net/",
+        "https://bot-hosting.net/a/panel",
+    ]
+    for url in candidate_urls:
+        try:
+            print(f"🌐 访问: {url}")
+            sb.open(url)
+            sb.wait_for_ready_state_complete()
+            sb.sleep(2)
+            src = sb.get_page_source()
+            up = _from_src(src)
+            if up:
+                return up
+
+            # 页面上可能有多个部署，尝试点进第一个带 Running 的卡片
+            # 用 JS 找包含 Running 文本的可点击节点
+            try:
+                clicked = sb.execute_script(r"""
+                    const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="server"], [class*="deploy"]'));
+                    for (const n of nodes) {
+                        const t = (n.innerText || n.textContent || '');
+                        if (/Running[\s]+\d/i.test(t) || /运行中/.test(t)) {
+                            n.click();
+                            return true;
+                        }
+                    }
+                    for (const n of nodes) {
+                        const href = n.getAttribute && n.getAttribute('href');
+                        if (href && /\/a\//.test(href) && !/billings|login|settings|billing/i.test(href)) {
+                            n.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                """)
+                if clicked:
+                    sb.sleep(3)
+                    sb.wait_for_ready_state_complete()
+                    up = _from_src(sb.get_page_source())
+                    if up:
+                        return up
+            except Exception as e:
+                print(f"⚠️ 点击服务卡片失败: {e}")
+        except Exception as e:
+            print(f"⚠️ 访问 {url} 失败: {e}")
+
+    return ""
 
 
 # ==================== Discord OAuth ====================
@@ -594,12 +696,13 @@ def do_renew(sb, current_expiry: str | None) -> bool:
 
 # ==================== 主流程 ====================
 def main():
-    global _START_TIME, _ACCOUNT
+    global _START_TIME, _ACCOUNT, _APP_UPTIME
     _START_TIME = time.time()
     _ACCOUNT = ""
+    _APP_UPTIME = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.2")
+    print("   Bot-hosting 自动续期 v2.3")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -702,6 +805,24 @@ def main():
             print(f"👤 登录账号: {_ACCOUNT}")
         else:
             print("⚠️ 未能从页面提取登录账号，将使用 EMAIL Secret")
+
+        # ---------- 提取 App 运行时长（服务器 Running 时间）----------
+        print("🔎 获取 App 运行时长...")
+        # 先从当前账单页试一次
+        _APP_UPTIME = extract_app_uptime(page_source) or ""
+        if not _APP_UPTIME:
+            _APP_UPTIME = fetch_app_uptime(sb) or ""
+        # 回到账单页，保证后续续期逻辑正常
+        try:
+            sb.open("https://bot-hosting.net/a/billings")
+            sb.wait_for_ready_state_complete()
+            sb.sleep(1.5)
+        except Exception:
+            pass
+        if _APP_UPTIME:
+            print(f"⏳ App 运行时长: {_APP_UPTIME}")
+        else:
+            print("⚠️ 未能获取 App 运行时长（可能需进入具体服务页）")
 
         # ---------- 执行续期 ----------
         do_renew(sb, current_expiry)
