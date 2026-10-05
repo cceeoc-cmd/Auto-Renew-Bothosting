@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.5
+Bot-hosting Auto Renew v2.6
 优化点：
 - 显式等待替代硬编码 sleep
 - 更稳健的元素定位与到期日期解析
@@ -310,30 +310,87 @@ def extract_account_email(page_source: str) -> str | None:
 
 
 def extract_app_uptime(page_source: str) -> str | None:
-    """从页面提取 Running 时长 → 中文"""
-    patterns = [
-        r"Running\s+((?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)",
-        r"运行中\s*[·•]?\s*((?:\d+天\s*)?(?:\d+小时\s*)?(?:\d+分\s*)?(?:\d+秒)?)",
-        r"Uptime[:\s]+((?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)",
+    """
+    从页面提取 Running / Uptime / Online 时长 → 中文。
+    规则（防误匹配）：
+    1. 只匹配紧跟在 Running / Uptime / Online • 后的「纯时长」片段
+    2. 整段必须只由 数字+单位(d/h/m/s 或 天/小时/分/秒) 组成，如 1m 10s、1d 6h 7m
+       排除 FREE-EU-RO-37、88.77 MiB 等
+    3. 折算超过 400 天的结果丢弃，返回 None（显示未知）
+    4. 不使用任何 API uptime / started_at 字段
+    """
+    # 捕获 Running / Uptime / Online 后的候选片段（限制长度，避免吞掉整段正文）
+    lead_patterns = [
+        r"Running\s+([0-9dhmsDHMS\s]{1,24})",
+        r"Uptime\s*[:：]?\s*([0-9dhmsDHMS\s]{1,24})",
+        r"Online\s*[·•]\s*([0-9dhmsDHMS\s]{1,24})",
+        r"运行中\s*[·•]?\s*([0-9天小时分秒\s]{1,24})",
     ]
-    raw = None
-    for pat in patterns:
-        m = re.search(pat, page_source, re.I)
-        if m:
-            raw = m.group(1).strip()
-            if raw:
-                break
-    if not raw:
-        return None
-    if any(x in raw for x in ("天", "小时", "分", "秒")):
-        return raw.replace(" ", "")
-    raw = raw.lower().replace(" ", "")
-    out = raw
-    out = re.sub(r"(\d+)d", r"\1天", out)
-    out = re.sub(r"(\d+)h", r"\1小时", out)
-    out = re.sub(r"(\d+)m", r"\1分", out)
-    out = re.sub(r"(\d+)s", r"\1秒", out)
-    return out if out else None
+
+    # 整段必须是纯时长：可选的 d/h/m/s 组合，至少有一个单位
+    pure_en = re.compile(
+        r"^\s*(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?\s*$",
+        re.I,
+    )
+    pure_zh = re.compile(
+        r"^\s*(?:(\d+)\s*天)?\s*(?:(\d+)\s*小时)?\s*(?:(\d+)\s*分)?\s*(?:(\d+)\s*秒)?\s*$",
+    )
+
+    def _parse_and_validate(raw: str) -> str | None:
+        raw = raw.strip()
+        if not raw:
+            return None
+        # 拒绝含小数点、字母混杂（除单位外）等
+        if re.search(r"[^0-9\sdhms天小时分秒]", raw, re.I):
+            return None
+
+        days = hours = mins = secs = 0
+        m = pure_en.match(raw)
+        if m and any(g is not None for g in m.groups()):
+            days = int(m.group(1) or 0)
+            hours = int(m.group(2) or 0)
+            mins = int(m.group(3) or 0)
+            secs = int(m.group(4) or 0)
+        else:
+            m = pure_zh.match(raw)
+            if not m or not any(g is not None for g in m.groups()):
+                return None
+            days = int(m.group(1) or 0)
+            hours = int(m.group(2) or 0)
+            mins = int(m.group(3) or 0)
+            secs = int(m.group(4) or 0)
+
+        # 至少有一个非零分量
+        if days + hours + mins + secs <= 0:
+            return None
+
+        total_days = days + hours / 24 + mins / 1440 + secs / 86400
+        if total_days > 400:
+            print(f"⚠️ 运行时长异常过大已丢弃: {raw} (约 {total_days:.1f} 天)")
+            return None
+
+        parts = []
+        if days:
+            parts.append(f"{days}天")
+        if hours:
+            parts.append(f"{hours}小时")
+        if mins:
+            parts.append(f"{mins}分")
+        if secs and not days:  # 有「天」时一般不再显示秒，更干净
+            parts.append(f"{secs}秒")
+        elif secs and not hours and not days:
+            parts.append(f"{secs}秒")
+        elif secs and (hours or days):
+            # 有小时/天时仍可保留秒，按需；这里保留
+            parts.append(f"{secs}秒")
+        return "".join(parts) if parts else None
+
+    for pat in lead_patterns:
+        for m in re.finditer(pat, page_source, re.I):
+            result = _parse_and_validate(m.group(1))
+            if result:
+                return result
+    return None
 
 
 def detect_server_status(page_source: str) -> str:
@@ -882,7 +939,7 @@ def main():
     _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.5")
+    print("   Bot-hosting 自动续期 v2.6")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
