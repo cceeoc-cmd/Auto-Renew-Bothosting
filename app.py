@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v2.3
+Bot-hosting Auto Renew v2.4
 优化点：
 - 显式等待替代硬编码 sleep
 - 更稳健的元素定位与到期日期解析
@@ -55,7 +55,8 @@ COOKIES = {
 _LOGIN_METHOD = "SESSION_TOKEN"
 _START_TIME = None  # 脚本启动时间
 _ACCOUNT = ""       # 登录后从页面提取的账号
-_APP_UPTIME = ""    # 面板上 App 的 Running 时长（服务器运行时间）
+_APP_UPTIME = ""    # 面板上 App 的 Running 时长
+_SERVER_STATUS = "" # running / started / start_failed / unknown
 TZ_CN = ZoneInfo("Asia/Shanghai")
 
 # Discord OAuth 常量
@@ -213,7 +214,15 @@ def format_notification(
         lines.append(extra)
     if error:
         lines.append(f"⚠️ 错误信息: {error}")
-    # 运行时长 = 面板上 App 的 Running 时间（服务器运行时间）
+    # 机器状态 / 运行时长
+    if _SERVER_STATUS:
+        status_map = {
+            "running": "🟢 运行中",
+            "started": "🟡 已开机",
+            "start_failed": "🔴 开机失败",
+            "unknown": "⚪ 状态未知",
+        }
+        lines.append(f"🖥️ 机器状态: {status_map.get(_SERVER_STATUS, _SERVER_STATUS)}")
     if _APP_UPTIME:
         lines.append(f"⏳ 运行时长: {_APP_UPTIME}")
     if script_duration:
@@ -301,13 +310,7 @@ def extract_account_email(page_source: str) -> str | None:
 
 
 def extract_app_uptime(page_source: str) -> str | None:
-    """
-    从面板提取 App 运行时长，例如：
-    Running 32m 57s  →  32分57秒
-    Running 1h 5m    →  1小时5分
-    Running 2d 3h    →  2天3小时
-    """
-    # 常见格式：Running 32m 57s / Running 1h 12m 5s / Running 2d 4h
+    """从页面提取 Running 时长 → 中文"""
     patterns = [
         r"Running\s+((?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)",
         r"运行中\s*[·•]?\s*((?:\d+天\s*)?(?:\d+小时\s*)?(?:\d+分\s*)?(?:\d+秒)?)",
@@ -322,12 +325,8 @@ def extract_app_uptime(page_source: str) -> str | None:
                 break
     if not raw:
         return None
-
-    # 已是中文则直接返回
     if any(x in raw for x in ("天", "小时", "分", "秒")):
         return raw.replace(" ", "")
-
-    # 英文单位转中文
     raw = raw.lower().replace(" ", "")
     out = raw
     out = re.sub(r"(\d+)d", r"\1天", out)
@@ -337,69 +336,204 @@ def extract_app_uptime(page_source: str) -> str | None:
     return out if out else None
 
 
-def fetch_app_uptime(sb) -> str:
-    """尝试从控制台/服务页抓取 App Running 时长"""
-    def _from_src(src: str) -> str:
-        return extract_app_uptime(src) or ""
+def detect_server_status(page_source: str) -> str:
+    """
+    返回: running / stopped / offline / unknown
+    """
+    lower = page_source.lower()
+    # 优先看明确状态
+    if re.search(r"running\s+\d", lower) or "运行中" in page_source:
+        return "running"
+    # Stopped / Offline / 已停止
+    if re.search(r"\bstopped\b", lower) or "已停止" in page_source or "已关机" in page_source:
+        return "stopped"
+    if re.search(r"\boffline\b", lower) or "离线" in page_source:
+        return "offline"
+    # 有明显 Start 按钮且没有 Running 计时，倾向 stopped
+    if re.search(r">\s*start\s*<", lower) and not re.search(r"running\s+\d", lower):
+        # 同时有 Stop 可能是 running；没有 Running 文本时保守判断
+        if "kill" in lower and "restart" in lower and not re.search(r"running", lower):
+            return "stopped"
+    return "unknown"
 
+
+def _click_start_button(sb) -> bool:
+    """点击开机/Start 按钮"""
+    selectors = [
+        'button:contains("Start")',
+        'button:contains("启动")',
+        'button:contains("开机")',
+        'a:contains("Start")',
+        '[aria-label*="Start" i]',
+        '[title*="Start" i]',
+    ]
+    for sel in selectors:
+        try:
+            if sb.is_element_visible(sel):
+                # 避免点到 Restart：文本刚好是 Start
+                text = ""
+                try:
+                    text = (sb.get_text(sel) or "").strip().lower()
+                except Exception:
+                    pass
+                if text and text not in ("start", "启动", "开机"):
+                    # 可能是 Restart / Start something else
+                    if "restart" in text or "重启" in text:
+                        continue
+                sb.click(sel)
+                print(f"✅ 已点击开机按钮: {sel} ({text or 'n/a'})")
+                return True
+        except Exception:
+            continue
+
+    # JS 兜底：找文本精确为 Start 的按钮
     try:
-        up = _from_src(sb.get_page_source())
-        if up:
-            return up
-    except Exception:
-        pass
+        clicked = sb.execute_script(r"""
+            const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            for (const n of nodes) {
+                const t = (n.innerText || n.textContent || '').trim().toLowerCase();
+                if (t === 'start' || t === '启动' || t === '开机') {
+                    n.click();
+                    return true;
+                }
+            }
+            return false;
+        """)
+        if clicked:
+            print("✅ 已通过 JS 点击 Start")
+            return True
+    except Exception as e:
+        print(f"⚠️ JS 点击 Start 失败: {e}")
+    return False
+
+
+def open_first_deployment(sb) -> bool:
+    """从控制台进入第一个部署/服务详情页"""
+    try:
+        clicked = sb.execute_script(r"""
+            const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="server"], [class*="deploy"], [class*="project"]'));
+            // 1) 带 Running/Stopped 状态的卡片
+            for (const n of nodes) {
+                const t = (n.innerText || n.textContent || '');
+                if (/Running[\s]+\d/i.test(t) || /Stopped/i.test(t) || /Offline/i.test(t) || /运行中|已停止|离线/.test(t)) {
+                    n.click();
+                    return 'status-card';
+                }
+            }
+            // 2) 像服务详情的链接
+            for (const n of nodes) {
+                const href = n.getAttribute && (n.getAttribute('href') || '');
+                if (href && /\/a\//.test(href) && !/billings|login|settings|billing|account|docs/i.test(href)) {
+                    n.click();
+                    return href;
+                }
+            }
+            // 3) 文本 Manage / Open
+            for (const n of nodes) {
+                const t = (n.innerText || n.textContent || '').trim().toLowerCase();
+                if (t === 'manage' || t === 'open' || t === '管理' || t === '打开') {
+                    n.click();
+                    return t;
+                }
+            }
+            return false;
+        """)
+        if clicked:
+            print(f"➡️ 进入服务页: {clicked}")
+            sb.sleep(3)
+            sb.wait_for_ready_state_complete()
+            return True
+    except Exception as e:
+        print(f"⚠️ 进入服务页失败: {e}")
+    return False
+
+
+def check_and_manage_server(sb) -> tuple[str, str]:
+    """
+    检测机器状态：
+      - running  → 记录运行时长，跳过开机
+      - stopped/offline → 执行开机
+    返回 (status, uptime_str)
+    status: running / started / start_failed / unknown
+    """
+    status = "unknown"
+    uptime = ""
 
     candidate_urls = [
         "https://bot-hosting.net/a/",
         "https://bot-hosting.net/",
         "https://bot-hosting.net/a/panel",
     ]
+
     for url in candidate_urls:
         try:
             print(f"🌐 访问: {url}")
             sb.open(url)
             sb.wait_for_ready_state_complete()
             sb.sleep(2)
-            src = sb.get_page_source()
-            up = _from_src(src)
-            if up:
-                return up
-
-            # 页面上可能有多个部署，尝试点进第一个带 Running 的卡片
-            # 用 JS 找包含 Running 文本的可点击节点
-            try:
-                clicked = sb.execute_script(r"""
-                    const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [class*="card"], [class*="server"], [class*="deploy"]'));
-                    for (const n of nodes) {
-                        const t = (n.innerText || n.textContent || '');
-                        if (/Running[\s]+\d/i.test(t) || /运行中/.test(t)) {
-                            n.click();
-                            return true;
-                        }
-                    }
-                    for (const n of nodes) {
-                        const href = n.getAttribute && n.getAttribute('href');
-                        if (href && /\/a\//.test(href) && !/billings|login|settings|billing/i.test(href)) {
-                            n.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                """)
-                if clicked:
-                    sb.sleep(3)
-                    sb.wait_for_ready_state_complete()
-                    up = _from_src(sb.get_page_source())
-                    if up:
-                        return up
-            except Exception as e:
-                print(f"⚠️ 点击服务卡片失败: {e}")
         except Exception as e:
-            print(f"⚠️ 访问 {url} 失败: {e}")
+            print(f"⚠️ 访问失败: {e}")
+            continue
 
-    return ""
+        src = sb.get_page_source()
+        st = detect_server_status(src)
+        up = extract_app_uptime(src) or ""
+        print(f"📊 页面状态: {st}, 时长: {up or '无'}")
+
+        if st == "running" or up:
+            return ("running", up)
+
+        # 尝试进入具体服务页
+        if open_first_deployment(sb):
+            src = sb.get_page_source()
+            st = detect_server_status(src)
+            up = extract_app_uptime(src) or ""
+            print(f"📊 服务页状态: {st}, 时长: {up or '无'}")
+            if st == "running" or up:
+                return ("running", up)
+
+            if st in ("stopped", "offline", "unknown"):
+                # 尝试开机
+                print("🔌 检测到未运行，尝试开机...")
+                if _click_start_button(sb):
+                    sb.sleep(8)
+                    sb.wait_for_ready_state_complete()
+                    src2 = sb.get_page_source()
+                    up2 = extract_app_uptime(src2) or ""
+                    st2 = detect_server_status(src2)
+                    if st2 == "running" or up2:
+                        print(f"✅ 开机成功，运行时长: {up2 or '启动中'}")
+                        return ("started", up2 or "启动中")
+                    # 再等一轮
+                    sb.sleep(5)
+                    src3 = sb.get_page_source()
+                    up3 = extract_app_uptime(src3) or ""
+                    if up3 or detect_server_status(src3) == "running":
+                        print(f"✅ 开机成功，运行时长: {up3 or '启动中'}")
+                        return ("started", up3 or "启动中")
+                    print("⚠️ 已点 Start，但状态仍未变为 Running")
+                    save_debug_screenshot(sb, "start_pending")
+                    return ("start_failed", "")
+                else:
+                    print("⚠️ 未找到 Start 按钮")
+                    save_debug_screenshot(sb, "no_start_btn")
+                    return ("start_failed", "")
+
+        # 当前列表页就显示 stopped，直接点 Start
+        if st in ("stopped", "offline"):
+            print("🔌 列表页显示未运行，尝试开机...")
+            if _click_start_button(sb):
+                sb.sleep(8)
+                src2 = sb.get_page_source()
+                up2 = extract_app_uptime(src2) or ""
+                if up2 or detect_server_status(src2) == "running":
+                    return ("started", up2 or "启动中")
+                return ("start_failed", "")
+
+    return (status, uptime)
 
 
+# ==================== Discord OAuth ====================
 # ==================== Discord OAuth ====================
 def capture_discord_state(sb) -> str:
     print("🔎 获取 Discord OAuth state...")
@@ -696,13 +830,14 @@ def do_renew(sb, current_expiry: str | None) -> bool:
 
 # ==================== 主流程 ====================
 def main():
-    global _START_TIME, _ACCOUNT, _APP_UPTIME
+    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS
     _START_TIME = time.time()
     _ACCOUNT = ""
     _APP_UPTIME = ""
+    _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v2.3")
+    print("   Bot-hosting 自动续期 v2.4")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -806,12 +941,19 @@ def main():
         else:
             print("⚠️ 未能从页面提取登录账号，将使用 EMAIL Secret")
 
-        # ---------- 提取 App 运行时长（服务器 Running 时间）----------
-        print("🔎 获取 App 运行时长...")
-        # 先从当前账单页试一次
-        _APP_UPTIME = extract_app_uptime(page_source) or ""
-        if not _APP_UPTIME:
-            _APP_UPTIME = fetch_app_uptime(sb) or ""
+        # ---------- 检测机器状态：运行中跳过，关机则开机 ----------
+        print("🔎 检测机器状态...")
+        _SERVER_STATUS, _APP_UPTIME = check_and_manage_server(sb)
+        if _SERVER_STATUS == "running":
+            print(f"✅ 机器运行中，运行时长: {_APP_UPTIME or '未知'}")
+        elif _SERVER_STATUS == "started":
+            print(f"✅ 已执行开机，运行时长: {_APP_UPTIME or '启动中'}")
+        elif _SERVER_STATUS == "start_failed":
+            print("❌ 开机失败或未找到 Start 按钮")
+            save_debug_screenshot(sb, "server_start_fail")
+        else:
+            print("⚠️ 未能确认机器状态")
+
         # 回到账单页，保证后续续期逻辑正常
         try:
             sb.open("https://bot-hosting.net/a/billings")
@@ -819,10 +961,6 @@ def main():
             sb.sleep(1.5)
         except Exception:
             pass
-        if _APP_UPTIME:
-            print(f"⏳ App 运行时长: {_APP_UPTIME}")
-        else:
-            print("⚠️ 未能获取 App 运行时长（可能需进入具体服务页）")
 
         # ---------- 执行续期 ----------
         do_renew(sb, current_expiry)
