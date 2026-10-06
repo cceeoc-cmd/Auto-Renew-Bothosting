@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v3.2
+Bot-hosting Auto Renew v3.3
+相对 v3.2 的改动：
+- 新增：登录账号自动识别 —— 先读环境变量 EMAIL；未设置时打开 /a/settings，
+        读取 Profile 里的 EMAIL 输入框；再退回「Signed in as xxx」用户名，最后才是页面文本提取
+
+相对 v3.1 的改动（v3.2）：
 相对 v3.1 的改动：
 - 修复：Turnstile 通过判断改为检查 cf-turnstile-response token（原来 iframe 内的词不在页面源码里，会立刻误判通过）
 - 修复：状态/时长只从状态卡片区域读取（在「CONSOLE xx lines」处截断），控制台里残留的
@@ -848,6 +853,51 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     return False
 
 
+# ==================== 登录账号识别 ====================
+SETTINGS_URL = f"{BASE}/a/settings"
+
+
+def read_account_from_settings(sb) -> str:
+    """打开设置页，读取 Profile 里的 EMAIL 输入框（值在 input.value，可见文本里没有）；
+    读不到再取「Signed in as xxx」里的用户名。"""
+    try:
+        sb.open(SETTINGS_URL)
+        sb.wait_for_ready_state_complete()
+        for _ in range(10):
+            val = sb.execute_script(r"""
+                const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                for (const el of document.querySelectorAll('input, textarea')) {
+                    const v = (el.value || '').trim();
+                    if (re.test(v)) return v;
+                }
+                return '';
+            """) or ""
+            if val and _is_real_email(val):
+                return val
+            sb.sleep(1)
+        m = re.search(r"Signed in as\s+(\S+)", body_text(sb), re.I)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        print(f"⚠️ 读取设置页账号失败: {e}")
+    return ""
+
+
+def resolve_account(sb, page_source: str, visible_text: str) -> str:
+    """优先级：EMAIL 环境变量 → 设置页邮箱/用户名 → 页面文本中的真实邮箱"""
+    if EMAIL:
+        print("👤 账号来源: EMAIL 环境变量")
+        return EMAIL
+    acc = read_account_from_settings(sb)
+    if acc:
+        print("👤 账号来源: 设置页")
+        return acc
+    acc = extract_account_email(page_source, visible_text) or ""
+    if acc:
+        print("👤 账号来源: 页面文本")
+    return acc
+
+
 # ==================== 主流程 ====================
 def goto_billings(sb) -> bool:
     sb.open(BILLINGS_URL)
@@ -863,7 +913,7 @@ def run():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.2")
+    print("   Bot-hosting 自动续期 v3.3")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -933,11 +983,11 @@ def run():
         current_expiry = extract_expiry_date(page_source)
         print(f"📅 当前到期日期: {current_expiry}" if current_expiry else "⚠️ 未能提取当前到期日期")
 
-        _ACCOUNT = EMAIL or extract_account_email(page_source, body_text(sb)) or ""
+        _ACCOUNT = resolve_account(sb, page_source, body_text(sb))
         if _ACCOUNT:
             print(f"👤 登录账号: {mask_email(_ACCOUNT)}")
         else:
-            print("⚠️ 未能从页面提取登录账号，将使用 EMAIL Secret")
+            print("⚠️ 未能识别登录账号，通知里将显示「未配置」")
 
         # ---------- 机器状态：运行中跳过，明确关机才开机 ----------
         print("🔎 检测机器状态...")
