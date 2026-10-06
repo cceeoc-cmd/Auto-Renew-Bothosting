@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v3.0
-相对 v2.9 的改动：
+Bot-hosting Auto Renew v3.2
+相对 v3.1 的改动：
+- 修复：Turnstile 通过判断改为检查 cf-turnstile-response token（原来 iframe 内的词不在页面源码里，会立刻误判通过）
+- 修复：状态/时长只从状态卡片区域读取（在「CONSOLE xx lines」处截断），控制台里残留的
+        Stopped/Offline/Uptime 日志不再干扰判断
+- 修复：登录/开机/续期失败时退出码为 1（Actions 显示红色）；意外异常也会发 Telegram 通知
+
+相对 v3.0 的改动：
+相对 v3.0 的改动：
+- 修复：运行时长支持 w（周）/ mo（月）/ y（年），如「Running 2w 2d 14h」
+- 修复：登录账号不再误取页面占位邮箱（如 you-compagny.com）；优先用 EMAIL Secret，
+        否则只从可见文本/去掉占位符与脚本后的源码里提取，并过滤示例/占位邮箱
+- 优化：状态已是 Running+时长时不再等「Console connected」；仅 Stopped 需要确认
+        （控制台连上，或连续稳定 8 秒）
+
+相对 v2.9（v3.0）的改动：
 - 修复：详情页等到「Console connected」后再判断状态，避免页面刚加载时的默认 Offline/Stopped 被误判为关机
 - 修复：Start 按钮同时检查 disabled / aria-disabled / class 含 disabled，置灰按钮不再误报「已点击」
 - 优化：SERVER_URL 只填路径（/a/d/<uuid>）时自动补全域名
@@ -20,6 +34,7 @@ Bot-hosting Auto Renew v3.0
 import os
 import re
 import sys
+import traceback
 import time
 import json
 import requests
@@ -60,6 +75,7 @@ _START_TIME = None
 _ACCOUNT = ""
 _APP_UPTIME = ""
 _SERVER_STATUS = ""  # running / started / start_failed / unknown
+_FAILED = False  # 任一关键步骤失败 → 退出码 1
 TZ_CN = ZoneInfo("Asia/Shanghai")
 
 # 侧边栏 / 非服务页路径，进入服务页时必须排除
@@ -247,13 +263,34 @@ def format_notification(
     return "\n".join(lines)
 
 
+def turnstile_token_ready(sb):
+    """True=已有 token；False=有控件但还没 token；None=页面里没有 Turnstile 控件"""
+    try:
+        return sb.execute_script(r"""
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            if (!inp) return null;
+            return !!(inp.value && inp.value.length > 20);
+        """)
+    except Exception:
+        return None
+
+
 def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
+    """
+    以 cf-turnstile-response token 为准。
+    5 秒内一直没出现 Turnstile 控件时，退回检查整页拦截文案（整页 CF 挑战场景）。
+    """
     indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     start = time.time()
     while time.time() - start < timeout:
-        if not any(x in sb.get_page_source().lower() for x in indicators):
-            print("✅ Turnstile 验证已通过")
+        tok = turnstile_token_ready(sb)
+        if tok is True:
+            print("✅ Turnstile 验证已通过（已获得 token）")
             return True
+        if tok is None and time.time() - start >= 5:
+            if not any(x in sb.get_page_source().lower() for x in indicators):
+                print("✅ 未发现 Turnstile 控件，按无需验证处理")
+                return True
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
     return False
@@ -297,37 +334,74 @@ def extract_expiry_date(page_source: str) -> str | None:
     return None
 
 
-def extract_account_email(page_source: str) -> str | None:
-    emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", page_source)
-    skip_domains = {
-        "example.com", "sentry.io", "w3.org", "github.com", "google.com",
-        "cloudflare.com", "discord.com", "bot-hosting.net",
-    }
-    for e in emails:
-        low = e.lower()
-        if low.split("@")[-1] in skip_domains:
-            continue
-        if any(x in low for x in ("support@", "admin@", "no-reply", "noreply")):
-            continue
-        return e
-    m = re.search(r"(?:logged in as|welcome|user(?:name)?)[:\s]+([\w.#-]{2,32})", page_source, re.I)
-    return m.group(1) if m else None
+_SKIP_DOMAINS = {
+    "example.com", "sentry.io", "w3.org", "github.com", "google.com",
+    "cloudflare.com", "discord.com", "bot-hosting.net",
+}
+_PLACEHOLDER_DOMAIN_WORDS = (
+    "compagny", "company", "example", "yourdomain", "domain", "sample", "test", "localhost",
+)
+_GENERIC_LOCALS = {
+    "you", "your", "user", "username", "name", "email", "test", "admin", "support",
+    "contact", "info", "hello", "noreply", "no-reply", "john", "jane", "john.doe",
+}
+_FILE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".js", ".css")
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
 
-_UNIT = r"(?:d|h|m|s)(?![a-zA-Z])|天|小时|分|秒"
+def _is_real_email(e: str) -> bool:
+    low = e.lower()
+    local, _, domain = low.partition("@")
+    if domain in _SKIP_DOMAINS or domain.endswith(_FILE_EXTS):
+        return False
+    if any(w in domain for w in _PLACEHOLDER_DOMAIN_WORDS):
+        return False
+    return local not in _GENERIC_LOCALS
+
+
+def extract_account_email(page_source: str, visible_text: str = "") -> str | None:
+    """
+    提取登录账号：
+    1) 可见文本里的真实邮箱
+    2) 去掉 <script>/<style> 和 placeholder 属性后的源码里的真实邮箱
+    占位/示例邮箱（如 you@you-compagny.com）一律过滤。
+    """
+    for e in _EMAIL_RE.findall(visible_text or ""):
+        if _is_real_email(e):
+            return e
+    cleaned = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", page_source or "", flags=re.S | re.I)
+    cleaned = re.sub(r"""placeholder\s*=\s*(".*?"|'.*?')""", "", cleaned, flags=re.S | re.I)
+    for e in _EMAIL_RE.findall(cleaned):
+        if _is_real_email(e):
+            return e
+    return None
+
+
+_CONSOLE_HEADER_RE = re.compile(r"\bconsole\b\s*\d+\s*lines?\b", re.I)
+
+
+def card_text(text: str) -> str:
+    """只保留状态卡片部分：在控制台标题（CONSOLE xx lines）之前截断，避开控制台日志干扰"""
+    text = text or ""
+    m = _CONSOLE_HEADER_RE.search(text)
+    return text[:m.start()] if m else text
+
+
+_UNIT = r"(?:mo|w|d|h|m|s|y)(?![a-zA-Z])|周|天|小时|分|秒"
 _UPTIME_RE = re.compile(
     r"(?:Running|Uptime\s*[:：]?|Online\s*[·•]|运行中\s*[·•]?)\s*"
     rf"((?:\d+\s*(?:{_UNIT})\s*)+)",
     re.I,
 )
 _PART_RE = re.compile(rf"(\d+)\s*({_UNIT})", re.I)
-_UNIT_SECONDS = {"d": 86400, "天": 86400, "h": 3600, "小时": 3600,
+_UNIT_SECONDS = {"y": 31536000, "mo": 2592000, "w": 604800, "周": 604800,
+                 "d": 86400, "天": 86400, "h": 3600, "小时": 3600,
                  "m": 60, "分": 60, "s": 1, "秒": 1}
 
 
 def extract_app_uptime(text: str) -> str | None:
     """从可见文本提取 Running 1d 6h 7m 之类的时长，转为中文。超过 400 天视为异常。"""
-    for m in _UPTIME_RE.finditer(text):
+    for m in _UPTIME_RE.finditer(card_text(text)):
         total = 0
         for num, unit in _PART_RE.findall(m.group(1)):
             total += int(num) * _UNIT_SECONDS[unit.lower()]
@@ -352,6 +426,7 @@ def detect_server_status(text: str) -> str:
     - 不用 "App is running"（控制台残留日志会误判）
     - 按钮文案 Start/Stop 不会被当成状态
     """
+    text = card_text(text)
     # 先看明确的停止徽章（优先于控制台旧日志）
     if re.search(r"\b(Stopped|Offline|Suspended)\b", text, re.I) or re.search(r"已停止|已关机|离线", text):
         # 若同时有 Running+时长徽章，以 Running 为准（刷新瞬间可能两者短暂共存）
@@ -367,25 +442,31 @@ def detect_server_status(text: str) -> str:
 def wait_page_ready(sb, timeout: int = 20) -> str:
     """
     等待 SPA 渲染完成后返回页面文本。
-    - 详情页：必须等到控制台连上（Console connected）再判断，
-      避免控制台连接前的默认 Offline/Stopped 被误判为关机
+    - Running + 时长：已是明确的运行状态，直接返回
+    - 详情页 Stopped：可能是控制台连接前的默认态，需等到 Console connected，
+      或连续稳定 8 秒才确认
     - 总览页：出现状态词或 slots 字样即可
     超时也返回当前文本。
     """
     end = time.time() + timeout
     text = ""
     need_console = is_detail_page(sb)
+    stopped_since = None
     while time.time() < end:
         text = body_text(sb)
-        ready = detect_server_status(text) != "unknown" or bool(
-            re.search(r"\d+\s*/\s*\d+\s*slots", text, re.I)
-        )
-        if ready and (not need_console or "console connected" in text.lower()):
-            sb.sleep(2)  # 状态徽章/时长通常比连接成功晚一点
-            return body_text(sb)
+        st = detect_server_status(text)
+        slots = bool(re.search(r"\d+\s*/\s*\d+\s*slots", text, re.I))
+        if st == "stopped" and need_console:
+            stopped_since = stopped_since or time.time()
+            if "console connected" in text.lower() or time.time() - stopped_since >= 8:
+                sb.sleep(1.5)
+                return body_text(sb)
+        else:
+            stopped_since = None
+            if st != "unknown" or slots:
+                sb.sleep(1.5)
+                return body_text(sb)
         sb.sleep(1)
-    if need_console and "console connected" not in text.lower():
-        print("⚠️ 等待控制台连接超时，状态可能不可靠")
     return text
 
 
@@ -688,6 +769,7 @@ def notify(status, **kw):
 
 
 def do_renew(sb, current_expiry: str | None) -> bool:
+    global _FAILED
     expiry_text = current_expiry or "（未获取到）"
     outer_selector, countdown_text = find_renew_button(sb)
 
@@ -707,6 +789,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         sb.wait_for_element_visible('button:contains("Renew for 4 days")', timeout=20)
     except Exception as e:
         print(f"❌ 点击外部按钮或等待模态框失败: {e}")
+        _FAILED = True
         save_debug_screenshot(sb, "renew_click_fail")
         notify("❌ 续期失败", error="点击外部续期按钮或模态框超时")
         return False
@@ -725,6 +808,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         print(f"⏳ 第 {attempt} 次未通过，重试...")
 
     if not passed:
+        _FAILED = True
         save_debug_screenshot(sb, "turnstile_fail")
         notify("❌ 续期失败", error="Turnstile 验证未通过")
         return False
@@ -735,6 +819,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         print("✅ 已点击续期按钮")
     except Exception as e:
         print(f"❌ 点击续期按钮失败: {e}")
+        _FAILED = True
         save_debug_screenshot(sb, "renew_confirm_fail")
         notify("❌ 续期失败", error="点击最终续期按钮失败")
         return False
@@ -757,6 +842,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         return True
 
     print("⚠️ 续期结果未知，到期日期未明显变化")
+    _FAILED = True
     save_debug_screenshot(sb, "renew_result_unknown")
     notify("⚠️ 续期可能未成功", extra="请登录后台检查", expiry_date=expiry_text)
     return False
@@ -771,13 +857,13 @@ def goto_billings(sb) -> bool:
     return "/a/billings" in url and "/login" not in url and "error=" not in url
 
 
-def main():
-    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD
+def run():
+    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED
     _START_TIME = time.time()
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.0")
+    print("   Bot-hosting 自动续期 v3.2")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -837,6 +923,7 @@ def main():
                 error_msg = "SESSION_TOKEN 失效且未配置 Discord Token"
             else:
                 error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
+            _FAILED = True
             notify("❌ 登录失败", error=error_msg)
             return
 
@@ -846,7 +933,7 @@ def main():
         current_expiry = extract_expiry_date(page_source)
         print(f"📅 当前到期日期: {current_expiry}" if current_expiry else "⚠️ 未能提取当前到期日期")
 
-        _ACCOUNT = extract_account_email(page_source) or ""
+        _ACCOUNT = EMAIL or extract_account_email(page_source, body_text(sb)) or ""
         if _ACCOUNT:
             print(f"👤 登录账号: {mask_email(_ACCOUNT)}")
         else:
@@ -866,6 +953,7 @@ def main():
         elif _SERVER_STATUS == "started":
             print(f"✅ 已执行开机，运行时长: {_APP_UPTIME or '启动中'}")
         elif _SERVER_STATUS == "start_failed":
+            _FAILED = True
             print("❌ 开机失败")
         else:
             print("⚠️ 未能确认机器状态")
@@ -877,7 +965,14 @@ def main():
             sb.sleep(1.5)
         except Exception:
             pass
-        do_renew(sb, current_expiry)
+        try:
+            do_renew(sb, current_expiry)
+        except Exception as e:
+            _FAILED = True
+            print(f"❌ 续期流程异常: {e}")
+            traceback.print_exc()
+            save_debug_screenshot(sb, "renew_exception")
+            notify("❌ 续期失败", error=f"续期流程异常: {str(e)[:150]}")
 
         # ---------- 更新 SESSION_TOKEN ----------
         print("🔄 检查 SESSION_TOKEN 是否需要更新")
@@ -895,6 +990,24 @@ def main():
             print("✅ SESSION_TOKEN 无需更新")
 
         print("🏁 脚本执行完毕")
+
+
+def main():
+    try:
+        run()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"❌ 脚本异常: {e}")
+        traceback.print_exc()
+        try:
+            notify("❌ 脚本异常", error=str(e)[:200])
+        except Exception:
+            pass
+        sys.exit(1)
+    if _FAILED:
+        print("❌ 存在失败步骤，退出码 1")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
