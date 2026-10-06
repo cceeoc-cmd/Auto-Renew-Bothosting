@@ -3,6 +3,7 @@
 """
 Bot-hosting Auto Renew v3.3
 相对 v3.2 的改动：
+- 修正：设置页 EMAIL 字段不是 input，改为以「EMAIL」标签为锚点读取所在块，同时兼容 input 与可见文本
 - 新增：登录账号自动识别 —— 先读环境变量 EMAIL；未设置时打开 /a/settings，
         读取 Profile 里的 EMAIL 输入框；再退回「Signed in as xxx」用户名，最后才是页面文本提取
 
@@ -858,25 +859,47 @@ SETTINGS_URL = f"{BASE}/a/settings"
 
 
 def read_account_from_settings(sb) -> str:
-    """打开设置页，读取 Profile 里的 EMAIL 输入框（值在 input.value，可见文本里没有）；
-    读不到再取「Signed in as xxx」里的用户名。"""
+    """
+    打开设置页读取 Profile 里的 EMAIL。
+    该字段看起来像输入框，但实际是普通元素，所以不能只扫 input：
+    1) 以「EMAIL」标签为锚点，在其所在块（向上 3 层）里找邮箱，兼容 div / input
+    2) 任意 input 的值
+    3) 页面可见文本里的真实邮箱
+    都读不到再取「Signed in as xxx」里的用户名。
+    """
     try:
         sb.open(SETTINGS_URL)
         sb.wait_for_ready_state_complete()
         for _ in range(10):
             val = sb.execute_script(r"""
-                const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                const re = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+                const labels = Array.from(document.querySelectorAll('*')).filter(
+                    e => e.children.length === 0 &&
+                         (e.textContent || '').trim().toLowerCase() === 'email');
+                for (const lb of labels) {
+                    let n = lb.parentElement;
+                    for (let d = 0; d < 3 && n; d++, n = n.parentElement) {
+                        const t = (n.innerText || '') + ' ' +
+                            Array.from(n.querySelectorAll('input')).map(i => i.value).join(' ');
+                        const m = t.match(re);
+                        if (m) return m[0];
+                    }
+                }
                 for (const el of document.querySelectorAll('input, textarea')) {
-                    const v = (el.value || '').trim();
-                    if (re.test(v)) return v;
+                    const m = (el.value || '').match(re);
+                    if (m) return m[0];
                 }
                 return '';
             """) or ""
             if val and _is_real_email(val):
                 return val
+            for e in _EMAIL_RE.findall(body_text(sb)):
+                if _is_real_email(e):
+                    return e
             sb.sleep(1)
         m = re.search(r"Signed in as\s+(\S+)", body_text(sb), re.I)
         if m:
+            print("⚠️ 设置页未读到邮箱，改用 Discord 用户名")
             return m.group(1)
     except Exception as e:
         print(f"⚠️ 读取设置页账号失败: {e}")
