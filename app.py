@@ -1,40 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-hosting Auto Renew v3.3
-相对 v3.2 的改动：
-- 修正：设置页 EMAIL 字段不是 input，改为以「EMAIL」标签为锚点读取所在块，同时兼容 input 与可见文本
-- 新增：登录账号自动识别 —— 先读环境变量 EMAIL；未设置时打开 /a/settings，
-        读取 Profile 里的 EMAIL 输入框；再退回「Signed in as xxx」用户名，最后才是页面文本提取
+Bot-hosting 自动续期
 
-相对 v3.1 的改动（v3.2）：
-相对 v3.1 的改动：
-- 修复：Turnstile 通过判断改为检查 cf-turnstile-response token（原来 iframe 内的词不在页面源码里，会立刻误判通过）
-- 修复：状态/时长只从状态卡片区域读取（在「CONSOLE xx lines」处截断），控制台里残留的
-        Stopped/Offline/Uptime 日志不再干扰判断
-- 修复：登录/开机/续期失败时退出码为 1（Actions 显示红色）；意外异常也会发 Telegram 通知
+流程：登录（SESSION_TOKEN 优先，失败回退 Discord OAuth）→ 检测机器状态（已停止则开机）
+      → 续期 → 刷新 SESSION_TOKEN → Telegram 通知
 
-相对 v3.0 的改动：
-相对 v3.0 的改动：
-- 修复：运行时长支持 w（周）/ mo（月）/ y（年），如「Running 2w 2d 14h」
-- 修复：登录账号不再误取页面占位邮箱（如 you-compagny.com）；优先用 EMAIL Secret，
-        否则只从可见文本/去掉占位符与脚本后的源码里提取，并过滤示例/占位邮箱
-- 优化：状态已是 Running+时长时不再等「Console connected」；仅 Stopped 需要确认
-        （控制台连上，或连续稳定 8 秒）
-
-相对 v2.9（v3.0）的改动：
-- 修复：详情页等到「Console connected」后再判断状态，避免页面刚加载时的默认 Offline/Stopped 被误判为关机
-- 修复：Start 按钮同时检查 disabled / aria-disabled / class 含 disabled，置灰按钮不再误报「已点击」
-- 优化：SERVER_URL 只填路径（/a/d/<uuid>）时自动补全域名
-- 优化：合并 check_and_manage_server 中重复的 running 返回分支
-
-相对 v2.8 的改动：
-- 修复：不再用控制台残留「App is running」判断运行中；Stopped/Offline 徽章优先
-
-相对 v2.7 的改动：
-- 修复：总览页显示 OFFLINE/Stopped 时先进入 /a/d/<uuid> 详情页再开机（总览页无 Start 按钮）
-- 修复：find_server_link 优先匹配 /a/d/<uuid>
-- 保留 v2.7：可见文本判状态、主内容区找链接、邮箱脱敏、gh secret stdin
+环境变量：
+  SESSION_TOKEN / DISCORD_TOKEN   登录凭据（至少一个）
+  EMAIL         可选，通知里显示的账号；未设置则自动从设置页读取
+  SERVER_URL    可选，服务详情页（/a/d/<uuid>）；未设置则自动发现
+  GH_TOKEN      可选，用于自动更新 SESSION_TOKEN Secret
+  TG_BOT_TOKEN / TG_CHAT_ID       Telegram 通知
+  IS_PROXY / PROXY_SERVER / HEADLESS
+  DEBUG         设为 true 时失败后输出页面文本与链接（已脱敏），默认关闭
 """
 
 import os
@@ -70,6 +49,7 @@ COOKIES = {"session_token": SESSION_TOKEN, "login": "true", "theme": "system"}
 BASE = "https://bot-hosting.net"
 BILLINGS_URL = f"{BASE}/a/billings"
 # 可选：直接指定服务页，例如 https://bot-hosting.net/a/d/<uuid>（只填 /a/d/<uuid> 也可）
+DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 SERVER_URL = (os.environ.get("SERVER_URL") or "").strip()
 if SERVER_URL.startswith("/"):
     SERVER_URL = BASE + SERVER_URL
@@ -143,6 +123,24 @@ def body_text(sb) -> str:
         return " ".join((sb.get_text("body") or "").split())
     except Exception:
         return ""
+
+
+_UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b")
+
+
+def redact(text: str) -> str:
+    """日志脱敏：UUID 只留首尾 4 位，邮箱按 mask_email 处理"""
+    text = _UUID_RE.sub(lambda m: m.group(0)[:4] + "***" + m.group(0)[-4:], text or "")
+    return _EMAIL_RE.sub(lambda m: mask_email(m.group(0)), text)
+
+
+def clean_url(url: str) -> str:
+    """只保留 协议://域名/路径，去掉查询参数，并脱敏 UUID"""
+    try:
+        u = urllib.parse.urlparse(url or "")
+        return redact(f"{u.scheme}://{u.netloc}{u.path}")
+    except Exception:
+        return "(无法解析)"
 
 
 def current_path(sb) -> str:
@@ -552,11 +550,12 @@ def click_start_button(sb) -> bool:
 
 
 def dump_debug(sb, tag: str):
-    """定位问题用：完整文本 + 全部链接 + 截图"""
-    print(f"📄 [{tag}] URL: {sb.get_current_url()}")
-    print(f"📄 [{tag}] 文本: {body_text(sb)[:1200]}")
-    links = [f"{'(nav) ' if l['chrome'] else ''}{l['text']} -> {l['href']}" for l in list_page_links(sb)]
-    print(f"🔗 [{tag}] 链接({len(links)}): " + " | ".join(links[:40]))
+    """定位问题用：脱敏 URL + 截图；DEBUG=true 时额外输出脱敏后的文本与链接"""
+    print(f"📄 [{tag}] URL: {clean_url(sb.get_current_url())}")
+    if DEBUG:
+        print(f"📄 [{tag}] 文本: {redact(body_text(sb))[:1200]}")
+        links = [f"{'(nav) ' if l['chrome'] else ''}{l['text']} -> {l['href']}" for l in list_page_links(sb)]
+        print(f"🔗 [{tag}] 链接({len(links)}): " + redact(" | ".join(links[:40])))
     save_debug_screenshot(sb, tag)
 
 
@@ -581,7 +580,6 @@ def check_and_manage_server(sb) -> tuple[str, str]:
     st, up, text = read_state(sb)
     on_detail = is_detail_page(sb)
     print(f"📊 {'服务页' if on_detail or SERVER_URL else '总览页'}状态: {st}, 时长: {up or '无'}")
-    print(f"📄 页面文本: {text[:400]}")
 
     if st == "running" or up:
         return "running", up
@@ -593,13 +591,12 @@ def check_and_manage_server(sb) -> tuple[str, str]:
             print("⚠️ 未找到服务器链接 (/a/d/...)")
             dump_debug(sb, "no_server_link")
             return "unknown", ""
-        print(f"➡️ 进入服务页: {href}")
+        print(f"➡️ 进入服务页: {redact(href)}")
         sb.open(BASE + href if href.startswith("/") else href)
         sb.wait_for_ready_state_complete()
         st, up, text = read_state(sb)
         on_detail = is_detail_page(sb)
         print(f"📊 服务页状态: {st}, 时长: {up or '无'} (detail={on_detail})")
-        print(f"📄 服务页文本: {text[:400]}")
         if st == "running" or up:
             return "running", up
 
@@ -640,7 +637,7 @@ def capture_discord_state(sb) -> str:
 
     url = sb.get_current_url()
     if "discord.com" not in url:
-        print(f"⚠️ 未跳转到 Discord 页面，当前 URL：{url}")
+        print(f"⚠️ 未跳转到 Discord 页面，当前 URL：{clean_url(url)}")
         return ""
     m = STATE_RE.search(url)
     if not m:
@@ -685,7 +682,7 @@ def discord_authorize(state: str) -> str:
             f"{DISCORD_API}?{query}", headers=headers, data=body, proxies=proxies, timeout=20
         )
         if resp.status_code != 200:
-            print(f"❌ Discord OAuth 失败: HTTP {resp.status_code} - {resp.text[:300]}")
+            print(f"❌ Discord OAuth 失败: HTTP {resp.status_code} - {redact(resp.text[:200])}")
             return ""
         data = resp.json()
     except Exception as e:
@@ -696,7 +693,7 @@ def discord_authorize(state: str) -> str:
     if not location:
         print(f"❌ 授权响应无 location: {data}")
         return ""
-    print(f"✅ 拿到回调 URL: {re.sub(r'code=[^&]+', 'code=***', location)}")
+    print(f"✅ 拿到回调 URL: {clean_url(location)}")
     return location
 
 
@@ -721,7 +718,7 @@ def do_discord_login(sb) -> bool:
         save_debug_screenshot(sb, "login_banned")
         return False
     if "bot-hosting.net" not in url:
-        print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{url}")
+        print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{clean_url(url)}")
         save_debug_screenshot(sb, "login_no_redirect")
         return False
     if "fraud" in body_text(sb).lower():
@@ -733,11 +730,11 @@ def do_discord_login(sb) -> bool:
         url = sb.get_current_url()
         path = urllib.parse.urlparse(url).path
         if "bot-hosting.net" in url and path != "/login" and not path.startswith("/login/discord"):
-            print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
+            print(f"✅ Discord OAuth 登录成功！当前页面：{clean_url(url)}")
             return True
         sb.sleep(0.5)
 
-    print(f"❌ 登录超时，最终停留在：{url}")
+    print(f"❌ 登录超时，最终停留在：{clean_url(url)}")
     save_debug_screenshot(sb, "login_timeout")
     return False
 
@@ -936,7 +933,7 @@ def run():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.3")
+    print("   Bot-hosting 自动续期 v3.4")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -945,7 +942,7 @@ def run():
 
     sb_kwargs = {"uc": True, "headless": headless}
     if is_proxy:
-        print(f"🔗 挂载代理: {proxy_server}")
+        print(f"🔗 挂载代理: {re.sub(r'//[^/@]*@', '//***@', proxy_server)}")
         sb_kwargs["proxy"] = proxy_server
     else:
         print("🍭 未使用代理，直连访问")
@@ -968,7 +965,7 @@ def run():
                 if value:
                     sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
             login_ok = goto_billings(sb)
-            print(f"📝 当前 URL: {sb.get_current_url()}")
+            print(f"📝 当前 URL: {clean_url(sb.get_current_url())}")
             if login_ok:
                 print("✅ SESSION_TOKEN 登录成功")
             else:
@@ -984,7 +981,7 @@ def run():
                 if login_ok:
                     print("✅ Discord OAuth 登录成功")
                 else:
-                    print(f"❌ 登录后仍未到达账单页: {sb.get_current_url()}")
+                    print(f"❌ 登录后仍未到达账单页: {clean_url(sb.get_current_url())}")
                     save_debug_screenshot(sb, "discord_billings_fail")
             else:
                 print("❌ Discord OAuth 登录失败")
