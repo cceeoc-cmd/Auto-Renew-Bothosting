@@ -285,9 +285,7 @@ def turnstile_widget_present(sb) -> bool:
 def turnstile_token_ready(sb):
     """
     True=已有 token；False=有控件但还没 token；None=页面里没有 Turnstile 控件。
-    主文档 + 所有可访问的 iframe 文档一起查 token；再以 widget iframe 的存在性兜底——
-    v3.4 只查主文档的 input，弹窗里的 Turnstile 其 token input 不在主文档，
-    会被误判为 None（"没有控件"），这是 2026-10-08 那次失败的直接原因。
+    主文档 + 所有可访问的 iframe 文档一起查 token，再以 widget iframe 的存在性兜底。
     """
     try:
         return sb.execute_script(r"""
@@ -314,29 +312,25 @@ def turnstile_solved(sb) -> bool:
     """
     bot check 是否已完成：
     - 有 token → True
-    - 压根没有 Turnstile 控件 → True（无需验证）
-    - 有控件但无 token → 看弹窗自己的解锁状态（锁定文案消失即为已解锁）
+    - 否则以弹窗自己的解锁状态为准：锁定文案消失才算通过
+    注意：找不到控件不能当作通过——iframe 是弹窗出现后才异步加载的，
+    刚打开弹窗时找不到控件很常见，但此时锁定文案已经在了。
     """
-    tok = turnstile_token_ready(sb)
-    if tok is True:
-        return True
-    if tok is None:
+    if turnstile_token_ready(sb) is True:
         return True
     try:
-        return BOT_CHECK_LOCK_TEXT not in (sb.get_text("body") or "")
+        text = " ".join((sb.get_text("body") or "").split()).lower()
     except Exception:
         return False
+    return BOT_CHECK_LOCK_TEXT.lower() not in text
 
 
 def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
-    """轮询等待 Turnstile 通过；控件不存在也算通过（无需验证的场景）"""
+    """轮询等待 Turnstile 通过（有 token 或弹窗已解锁）"""
     start = time.time()
     while time.time() - start < timeout:
         if turnstile_solved(sb):
-            if turnstile_widget_present(sb):
-                print("✅ Turnstile 验证已通过")
-            else:
-                print("✅ 未发现 Turnstile 控件，按无需验证处理")
+            print("✅ Turnstile 验证已通过")
             return True
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
@@ -347,8 +341,8 @@ def click_turnstile_checkbox_direct(sb) -> bool:
     """
     切进 Turnstile iframe 直接点复选框。
     背景：sb.uc_gui_click_captcha() 只认 .cf-turnstile-wrapper 包裹的标准结构，
-    续期弹窗里是裸 Turnstile（无 wrapper 包裹），它点不中且不报错——
-    截图证明复选框全程未被勾选。只能自己进 iframe 点。
+    续期弹窗里是裸 Turnstile（无 wrapper 包裹），它点不中且不报错。
+    注意：脚本触发的点击 Cloudflare 未必认，复选框也可能在 closed shadow DOM 里。
     """
     try:
         sb.switch_to_frame(TURNSTILE_IFRAME_CSS, timeout=10)
@@ -879,7 +873,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     print("🔒 处理 Turnstile 验证...")
     passed = False
     for attempt in range(1, 4):
-        # 每次先看是否已经通过（无控件 / 已有 token / 已解锁都算通过）
+        # 每次先看是否已经通过（有 token 或弹窗已解锁）
         if wait_for_turnstile_pass(sb, timeout=5):
             passed = True
             break
@@ -892,7 +886,17 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         if wait_for_turnstile_pass(sb, timeout=10):
             passed = True
             break
-        # 方式2：直接进 iframe 点复选框（弹窗裸 Turnstile 的兜底）
+        # 方式2：uc_gui_handle_captcha（较新版本 SeleniumBase 才有）
+        try:
+            if hasattr(sb, "uc_gui_handle_captcha"):
+                sb.uc_gui_handle_captcha()
+                print(f"🖱️ 第 {attempt} 次 uc_gui_handle_captcha")
+        except Exception as e:
+            print(f"⚠️ 第 {attempt} 次 uc_gui_handle_captcha 出错: {e}")
+        if wait_for_turnstile_pass(sb, timeout=10):
+            passed = True
+            break
+        # 方式3：直接进 iframe 点复选框（兜底）
         click_turnstile_checkbox_direct(sb)
         if wait_for_turnstile_pass(sb, timeout=20):
             passed = True
@@ -916,7 +920,8 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         notify("❌ 续期失败", error="点击最终续期按钮失败")
         return False
 
-    # 点击后轮询最多 30 秒：倒计时出现 / 到期日变化 / 弹窗关闭，任一即判
+    # 点击后轮询最多 30 秒：出现新倒计时，或到期日变化即判成功。
+    # 不再因「弹窗关闭」提前退出——此时页面上的倒计时/到期日可能还没刷新。
     deadline = time.time() + 30
     new_expiry, new_match, modal_open = None, None, True
     while time.time() < deadline:
@@ -927,7 +932,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
             modal_open = sb.is_element_visible('button:contains("Renew for 4 days")')
         except Exception:
             modal_open = True
-        if new_match or (new_expiry and new_expiry != current_expiry) or not modal_open:
+        if new_match or (new_expiry and new_expiry != current_expiry):
             break
         sb.sleep(3)
 
@@ -1040,7 +1045,7 @@ def run():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.5")
+    print("   Bot-hosting 自动续期 v3.6")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
