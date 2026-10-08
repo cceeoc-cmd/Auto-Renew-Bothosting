@@ -267,36 +267,115 @@ def format_notification(
     return "\n".join(lines)
 
 
+TURNSTILE_IFRAME_CSS = 'iframe[src*="challenges.cloudflare.com"]'
+# 续期弹窗里按钮锁定时的提示文案（截图实测）：bot check 完成前按钮点不动
+BOT_CHECK_LOCK_TEXT = "Complete the bot check to unlock the button"
+
+
+def turnstile_widget_present(sb) -> bool:
+    """Turnstile widget 的 iframe 是否存在（iframe 元素在主 DOM 里；内容跨域不可见也算存在）"""
+    try:
+        return bool(sb.execute_script(
+            'return !!document.querySelector(\'iframe[src*="challenges.cloudflare.com"]\');'
+        ))
+    except Exception:
+        return False
+
+
 def turnstile_token_ready(sb):
-    """True=已有 token；False=有控件但还没 token；None=页面里没有 Turnstile 控件"""
+    """
+    True=已有 token；False=有控件但还没 token；None=页面里没有 Turnstile 控件。
+    主文档 + 所有可访问的 iframe 文档一起查 token；再以 widget iframe 的存在性兜底——
+    v3.4 只查主文档的 input，弹窗里的 Turnstile 其 token input 不在主文档，
+    会被误判为 None（"没有控件"），这是 2026-10-08 那次失败的直接原因。
+    """
     try:
         return sb.execute_script(r"""
-            const inp = document.querySelector('input[name="cf-turnstile-response"]');
-            if (!inp) return null;
-            return !!(inp.value && inp.value.length > 20);
+            const docs = [document];
+            for (const f of document.querySelectorAll('iframe')) {
+                try { if (f.contentDocument) docs.push(f.contentDocument); } catch (e) {}
+            }
+            let found = false;
+            for (const d of docs) {
+                const inp = d.querySelector('input[name="cf-turnstile-response"]');
+                if (inp) {
+                    found = true;
+                    if (inp.value && inp.value.length > 20) return true;
+                }
+            }
+            if (found) return false;
+            return document.querySelector('iframe[src*="challenges.cloudflare.com"]') ? false : null;
         """)
     except Exception:
         return None
 
 
+def turnstile_solved(sb) -> bool:
+    """
+    bot check 是否已完成：
+    - 有 token → True
+    - 压根没有 Turnstile 控件 → True（无需验证）
+    - 有控件但无 token → 看弹窗自己的解锁状态（锁定文案消失即为已解锁）
+    """
+    tok = turnstile_token_ready(sb)
+    if tok is True:
+        return True
+    if tok is None:
+        return True
+    try:
+        return BOT_CHECK_LOCK_TEXT not in (sb.get_text("body") or "")
+    except Exception:
+        return False
+
+
 def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
-    """
-    以 cf-turnstile-response token 为准。
-    5 秒内一直没出现 Turnstile 控件时，退回检查整页拦截文案（整页 CF 挑战场景）。
-    """
-    indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
+    """轮询等待 Turnstile 通过；控件不存在也算通过（无需验证的场景）"""
     start = time.time()
     while time.time() - start < timeout:
-        tok = turnstile_token_ready(sb)
-        if tok is True:
-            print("✅ Turnstile 验证已通过（已获得 token）")
-            return True
-        if tok is None and time.time() - start >= 5:
-            if not any(x in sb.get_page_source().lower() for x in indicators):
+        if turnstile_solved(sb):
+            if turnstile_widget_present(sb):
+                print("✅ Turnstile 验证已通过")
+            else:
                 print("✅ 未发现 Turnstile 控件，按无需验证处理")
-                return True
+            return True
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
+    return False
+
+
+def click_turnstile_checkbox_direct(sb) -> bool:
+    """
+    切进 Turnstile iframe 直接点复选框。
+    背景：sb.uc_gui_click_captcha() 只认 .cf-turnstile-wrapper 包裹的标准结构，
+    续期弹窗里是裸 Turnstile（无 wrapper 包裹），它点不中且不报错——
+    截图证明复选框全程未被勾选。只能自己进 iframe 点。
+    """
+    try:
+        sb.switch_to_frame(TURNSTILE_IFRAME_CSS, timeout=10)
+    except Exception as e:
+        print(f"⚠️ 切入 Turnstile iframe 失败: {e}")
+        return False
+    try:
+        clicked = sb.execute_script(r"""
+            const el = document.querySelector('label input[type="checkbox"]')
+                || document.querySelector('input[type="checkbox"]')
+                || document.querySelector('label')
+                || document.querySelector('[role="checkbox"]');
+            if (el) { el.click(); return true; }
+            return false;
+        """)
+    except Exception as e:
+        print(f"⚠️ iframe 内点击复选框异常: {e}")
+        clicked = False
+    finally:
+        try:
+            sb.switch_to_default_content()
+        except Exception:
+            pass
+    if clicked:
+        print("✅ 已在 Turnstile iframe 内点击复选框")
+        return True
+    print("⚠️ iframe 内未找到可点击的复选框元素")
     return False
 
 
@@ -800,12 +879,22 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     print("🔒 处理 Turnstile 验证...")
     passed = False
     for attempt in range(1, 4):
+        # 每次先看是否已经通过（无控件 / 已有 token / 已解锁都算通过）
+        if wait_for_turnstile_pass(sb, timeout=5):
+            passed = True
+            break
+        # 方式1：seleniumbase 的 GUI 点击（标准 wrapper 结构有效）
         try:
             sb.uc_gui_click_captcha()
-            sb.sleep(8)
+            print(f"🖱️ 第 {attempt} 次 GUI 点击 Turnstile")
         except Exception as e:
-            print(f"⚠️ 第 {attempt} 次点击 Turnstile 出错: {e}")
-        if wait_for_turnstile_pass(sb, timeout=18):
+            print(f"⚠️ 第 {attempt} 次 GUI 点击 Turnstile 出错: {e}")
+        if wait_for_turnstile_pass(sb, timeout=10):
+            passed = True
+            break
+        # 方式2：直接进 iframe 点复选框（弹窗裸 Turnstile 的兜底）
+        click_turnstile_checkbox_direct(sb)
+        if wait_for_turnstile_pass(sb, timeout=20):
             passed = True
             break
         print(f"⏳ 第 {attempt} 次未通过，重试...")
@@ -813,7 +902,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     if not passed:
         _FAILED = True
         save_debug_screenshot(sb, "turnstile_fail")
-        notify("❌ 续期失败", error="Turnstile 验证未通过")
+        notify("❌ 续期失败", error="Turnstile 验证未通过（复选框未完成，续期按钮处于锁定状态）")
         return False
 
     print("⏳ 点击「Renew for 4 days」...")
@@ -827,10 +916,20 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         notify("❌ 续期失败", error="点击最终续期按钮失败")
         return False
 
-    sb.sleep(6)
-    new_page = sb.get_page_source()
-    new_expiry = extract_expiry_date(new_page)
-    new_match = COUNTDOWN_RE.search(new_page)
+    # 点击后轮询最多 30 秒：倒计时出现 / 到期日变化 / 弹窗关闭，任一即判
+    deadline = time.time() + 30
+    new_expiry, new_match, modal_open = None, None, True
+    while time.time() < deadline:
+        new_page = sb.get_page_source()
+        new_expiry = extract_expiry_date(new_page)
+        new_match = COUNTDOWN_RE.search(new_page)
+        try:
+            modal_open = sb.is_element_visible('button:contains("Renew for 4 days")')
+        except Exception:
+            modal_open = True
+        if new_match or (new_expiry and new_expiry != current_expiry) or not modal_open:
+            break
+        sb.sleep(3)
 
     if new_match:
         cd = new_match.group(1)
@@ -843,6 +942,14 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         print(f"✅ 续期成功，到期日期更新为: {new_expiry}")
         notify("✅ 续期成功", extra="到期日期已更新", expiry_date=new_expiry)
         return True
+
+    # 弹窗还开着且 bot check 仍未通过 → 按钮是锁定的，之前那次点击根本没生效
+    if modal_open and not turnstile_solved(sb):
+        print("❌ 续期未执行：Turnstile 仍未通过，续期按钮处于锁定状态")
+        _FAILED = True
+        save_debug_screenshot(sb, "renew_locked")
+        notify("❌ 续期失败", error="Turnstile 未通过，续期按钮被锁定", expiry_date=expiry_text)
+        return False
 
     print("⚠️ 续期结果未知，到期日期未明显变化")
     _FAILED = True
@@ -933,7 +1040,7 @@ def run():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.4")
+    print("   Bot-hosting 自动续期 v3.5")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
